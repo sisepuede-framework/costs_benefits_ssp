@@ -1,0 +1,9 @@
+name: cb_dev_env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - sqlalchemy>=2.0.29
+  - openpyxl>=3.1.2
+  - pandas>=2.2.1
