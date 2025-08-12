@@ -2,41 +2,38 @@ from costs_benefits_ssp.cb_calculate import CostBenefits
 import pandas as pd 
 import os 
 
-
-
-# Set dir paths
+# Set directory paths
 DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 TEST_RUNS_RESULTS_PATH = os.path.join(DIR_PATH, "test_runs_results")
 REGION_RESULTS_PATH = os.path.join(TEST_RUNS_RESULTS_PATH, "mexico")
 build_path = lambda PATH  : os.path.abspath(os.path.join(*PATH))
 SSP_RESULTS_PATH = build_path([REGION_RESULTS_PATH,"ssp_data"])
 
-### Directorio de configuración de tablas de costos
+# Directory for cost table configuration
 CB_DEFAULT_DEFINITION_PATH = build_path([REGION_RESULTS_PATH, "cost_factors"])
 
-### Directorio de salidas del módulo de costos y beneficios
+# Output directory for cost and benefit module results
 OUTPUT_CB_PATH = build_path([REGION_RESULTS_PATH, "cb_results"])
 os.makedirs(OUTPUT_CB_PATH, exist_ok=True)
 
-### Directorio de datos requeridos paragenerar el archivo tornado_plot_data_QA_QC.csv
+# Directory for data required to generate the tornado_plot_data_QA_QC.csv file
 QA_PATH = build_path([DIR_PATH, "edgar_cw"])
 
-## Cargamos los datos
+# Load data
 ssp_data = pd.read_csv(os.path.join(SSP_RESULTS_PATH, "sisepuede_results_sisepuede_run_2025-02-11T11;37;41.739098_WIDE_INPUTS_OUTPUTS.csv"))
 att_primary = pd.read_csv(os.path.join(SSP_RESULTS_PATH, "ATTRIBUTE_PRIMARY.csv"))
 att_strategy = pd.read_csv(os.path.join(SSP_RESULTS_PATH, "ATTRIBUTE_STRATEGY.csv"))
 
 #ssp_data = ssp_data.drop(columns = ["totalvalue_enfu_fuel_consumed_inen_fuel_hydrogen", "totalvalue_enfu_fuel_consumed_inen_fuel_furnace_gas"])
 
-# Definimos la estrategia baseline
+# Define the baseline strategy
 strategy_code_base = "BASE"
 
-## Instanciamos un objeto de la clase CostBenefits 
+# Instantiate an object of the CostBenefits class
 cb = CostBenefits(ssp_data, att_primary, att_strategy, strategy_code_base)
 
-
-## El método export_db_to_excel guarda la configuración inicial de las tablas de costos a un archivo excel. 
-### Cada pestaña representa una tabla en la base de datos del programa de costos y beneficios.
+# The export_db_to_excel method saves the initial configuration of the cost tables to an Excel file.
+# Each sheet represents a table in the cost and benefits program database.
 CB_DEFAULT_DEFINITION_FILE_PATH = os.path.join(CB_DEFAULT_DEFINITION_PATH, "cb_config_params.xlsx")
 
 # CHECK IF THE FILE EXISTS
@@ -49,14 +46,14 @@ else:
 cb.load_cb_parameters(CB_DEFAULT_DEFINITION_FILE_PATH)
 
 #------ System Costs
-## Calculamos los system costs para todas las estrategias
+# Calculate system costs for all strategies
 results_system = cb.compute_system_cost_for_all_strategies(verbose=True)
 
 #-------Technical Costs
-## Calculamos los technical costs para todas las estrategias
+# Calculate technical costs for all strategies
 results_tx = cb.compute_technical_cost_for_all_strategies(verbose=True)
 
-# Combina resultados
+# Combine results
 results_all = pd.concat([results_system, results_tx], ignore_index = True)
 
 #-------------POST PROCESS SIMULATION RESULTS---------------
