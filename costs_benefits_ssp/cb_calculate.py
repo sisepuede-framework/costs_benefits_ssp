@@ -379,6 +379,60 @@ class CostBenefits:
         """
         self._build_caches()
 
+    def insert_cb_records(
+                self,
+                table_name: str,
+                records: Union[pd.DataFrame, List[Dict[str, Any]]],
+        ) -> None:
+        """
+        Inserta filas en cualquier tabla de configuración del paquete sin
+        necesidad de pasar por el ciclo Excel. Útil para registrar nuevas
+        transformations, factores de costo, interacciones, etc. desde código.
+
+        Parámetros
+        ----------
+        table_name : str
+            Nombre físico de la tabla (el `__tablename__` del modelo
+            SQLAlchemy). Valores válidos: `attribute_transformation_code`,
+            `tx_table`, `transformation_costs`, `cost_factors`,
+            `strategy_interactions`, `countries_by_iso`,
+            `attribute_dim_time_period`, `agrc_lvst_productivity_costgdp`,
+            `agrc_rice_mgmt_tx`, `entc_reduce_losses_cost_file`,
+            `ippu_ccs_cost_factors`, `ippu_fgas_designations`,
+            `LNDU_soil_carbon_fractions`, `LVST_enteric_fermentation_tx`,
+            `lvst_tlu_conversions`, `pflo_transition_to_new_diets`,
+            `wali_sanitation_classification`.
+        records : pd.DataFrame | list[dict]
+            Filas a añadir. Las columnas deben coincidir con las del schema.
+
+        Notas
+        -----
+        - Las inserciones son append (no reemplazan filas existentes). Si una
+          primary key ya existe, SQLAlchemy lanzará un IntegrityError.
+        - Después de insertar se invalida el cache interno para que las
+          próximas llamadas a `compute_*` usen los registros nuevos.
+        """
+        if isinstance(records, list):
+            df = pd.DataFrame(records)
+        elif isinstance(records, pd.DataFrame):
+            df = records
+        else:
+            raise TypeError(
+                "records debe ser pd.DataFrame o list[dict]; "
+                f"se recibió {type(records).__name__}"
+            )
+
+        if df.empty:
+            return
+
+        df.to_sql(
+            table_name,
+            self.session.bind,
+            if_exists="append",
+            index=False,
+        )
+        self._invalidate_caches()
+
     ##############################################
 	#------------- UTILITIES   ------------#
 	##############################################
