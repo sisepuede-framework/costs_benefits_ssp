@@ -832,7 +832,9 @@ class CostBenefits:
         ) -> pd.DataFrame:
 
         #SHIFT any stray costs incurred from 2015 to 2025 to 2025 and 2035
-        res_pre2025 = res.query(f"time_period<{SSP_GLOBAL_TIME_PERIOD_TX_START}")#get the subset of early costs
+        # .copy() explícito para evitar SettingWithCopyWarning: query()
+        # retorna una vista y a continuación asignamos columnas.
+        res_pre2025 = res.query(f"time_period<{SSP_GLOBAL_TIME_PERIOD_TX_START}").copy()
         res_pre2025["variable"] = res_pre2025["variable"] + "_shifted" + (res_pre2025["time_period"]+SSP_GLOBAL_TIME_PERIOD_0).astype(str)#create a new variable so they can be recognized as shifted costs
         res_pre2025["time_period"] = res_pre2025["time_period"]+SSP_GLOBAL_TIME_PERIOD_TX_START #shift the time period
 
@@ -1039,7 +1041,7 @@ class CostBenefits:
             data_merged["time_period_for_multiplier_change"] = np.maximum(0,data_merged["time_period"]-SSP_GLOBAL_TIME_PERIOD_2023)
             data_merged["values"] = data_merged["difference"]*cb_orm.multiplier*cb_orm.annual_change**data_merged["time_period_for_multiplier_change"]  
 
-            tmp = data_merged[id_vars]
+            tmp = data_merged[id_vars].copy()
             tmp["difference_variable"] = cb_orm.diff_var
             tmp["difference_value"] = data_merged["difference"]
             tmp["variable"] = cb_orm.output_variable_name
@@ -1252,7 +1254,7 @@ class CostBenefits:
             data_merged["value"] = data_merged["difference_value"]*cb_orm.multiplier
             
                 
-            data_output = data_merged[diff_clinker.columns.to_list()]
+            data_output = data_merged[diff_clinker.columns.to_list()].copy()
             
             ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
             ## En este caso, se pondrá cero en el valor del baseline
@@ -1445,7 +1447,7 @@ class CostBenefits:
         
             cols_required = ['qty_waso_total_food_produced_tonne', 'qty_agrc_food_produced_lost_sent_to_msw_tonne','factor_waso_waste_per_capita_scalar_food']
 
-            food_waste_data = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + cols_required].reset_index(drop = True)
+            food_waste_data = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + cols_required].reset_index(drop = True).copy()
         
             #Get teh consumer food waste amount
             food_waste_data["consumer_food_waste"] = (food_waste_data["qty_waso_total_food_produced_tonne"]) 
