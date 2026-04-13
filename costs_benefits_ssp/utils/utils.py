@@ -6,10 +6,10 @@ def build_path(PATH : List[str]) -> str:
 
 def get_tx_prefix(tx : str, ssp_txs : List[str]) -> Optional[str]:
     """
-    Devuelve el primer transformation_code de `ssp_txs` del cual `tx` es un
-    prefijo, o `None` si ninguno aplica. A diferencia de la versión previa,
-    NO imprime a stdout cuando no hay match — el caller se encarga del
-    reporte consolidado para evitar cientos de líneas repetidas.
+    Return the first transformation_code in `ssp_txs` that `tx` starts with,
+    or `None` if no candidate matches. Unlike the previous version, this
+    function does NOT print to stdout when no match is found — the caller
+    handles the consolidated report so we avoid hundreds of repeated lines.
     """
     for ssp_tx in ssp_txs:
         if tx.startswith(ssp_tx):
