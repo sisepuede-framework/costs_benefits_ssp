@@ -1,19 +1,16 @@
-from typing import List, Union, Dict, Callable
+from typing import List, Union, Dict, Callable, Any
 from sqlalchemy.orm import Session
-import pandas as pd 
-#import polars as pl 
+import pandas as pd
 
 import warnings
 
 import logging
 
-import numpy as np 
+import numpy as np
 import re
 
-import os 
+import os
 import shutil
-
-from multiprocessing import Pool
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -37,17 +34,17 @@ from sqlalchemy import update
 
 class CostBenefits:
     """
-    Clase que carga los archivos definidos en los Enum.
+    Class that loads the files defined in the Enums.
 
-    Argumentos de inicialización
+    Initialization arguments
     -----------------------------
 
-    - data_file_path : directorio donde se encuentran los datos a cargar
-    
-    
-    Argumentos opcionales
+    - data_file_path : directory where the input data is stored
+
+
+    Optional arguments
     -----------------------------
-    - logger : objeto logger opcional para dar seguimiento a los eventos de lectura de archivos
+    - logger : optional logger instance to track file-loading events
 
     """
     def __init__(self, 
@@ -63,10 +60,18 @@ class CostBenefits:
         self.att_strategy = att_strategy
         self.strategy_code_base = strategy_code_base
         self.ssp_data = self.marge_attribute_strategy(ssp_data, att_primary, att_strategy)
-        self.ssp_list_of_vars = list(self.ssp_data) 
+        self.ssp_list_of_vars = list(self.ssp_data)
         self.ssp_data = self.add_additional_columns()
-        self.ssp_list_of_vars = list(self.ssp_data) 
-        #self.pl_ssp_data = pl.from_pandas(self.ssp_data)
+        self.ssp_list_of_vars = list(self.ssp_data)
+        # Índice por columna para acceso O(1) (usado por varias optimizaciones).
+        self._ssp_col_set = set(self.ssp_list_of_vars)
+
+        # In-memory caches of every configuration table plus per-strategy
+        # views of `ssp_data`. These replace the SQL reads and per-call
+        # copies that the original code performed inside every `cb_*`
+        # function.
+        self._build_caches()
+        self._build_strategy_views()
 
 
     ##############################################
@@ -114,13 +119,49 @@ class CostBenefits:
                 att_strategy : pd.DataFrame,
         ) -> Dict[str, List[str]]:
 
-        # Obtenemos lista de transformaciones de SSP
+        # Get the list of transformations supported by the package.
         ssp_txs = [i.transformation_code for i in self.session.query(AttTransformationCode).all()]
 
         original_strategy_to_txs = att_strategy[["strategy_code", "transformation_specification"]].to_records(index = False)
-        
-        strategy_to_txs = {strategy : [get_tx_prefix(transformation, ssp_txs) for transformation in transformations.split("|")] 
-        for strategy,transformations in original_strategy_to_txs}
+
+        # Resolve prefixes per transformation. We collect any TX that cannot
+        # be resolved in a set and report them once at the end, instead of
+        # printing one line per occurrence (the previous behaviour produced
+        # hundreds of repeated lines when a TX appeared in many strategies).
+        missing_txs: set = set()
+        strategy_to_txs: Dict[str, List[str]] = {}
+
+        for strategy, transformations in original_strategy_to_txs:
+            resolved: List[str] = []
+            for transformation in transformations.split("|"):
+                prefix = get_tx_prefix(transformation, ssp_txs)
+                if prefix is None:
+                    missing_txs.add(transformation)
+                else:
+                    resolved.append(prefix)
+            strategy_to_txs[strategy] = resolved
+
+        # Expose the set as an attribute so users can inspect which TXs are
+        # not supported by this version of the package.
+        self.missing_transformation_codes = sorted(missing_txs)
+
+        if missing_txs:
+            msg_lines = [
+                "The following transformations are NOT in the "
+                "attribute_transformation_code table of the costs_benefits_ssp "
+                "package and will therefore be ignored when computing costs "
+                "and benefits:",
+            ]
+            msg_lines.extend(f"  - {tx}" for tx in self.missing_transformation_codes)
+            msg_lines.append(
+                "If any of these transformations must contribute to the cost "
+                "computation, add the corresponding record either via "
+                "`insert_cb_records('attribute_transformation_code', ...)` or "
+                "by editing the `attribute_transformation_code` sheet of the "
+                "Excel configuration file and reloading with "
+                "`load_cb_parameters`."
+            )
+            warnings.warn("\n".join(msg_lines))
 
         return strategy_to_txs
 
@@ -128,7 +169,7 @@ class CostBenefits:
                 self,
                 ) -> pd.DataFrame:
         
-        # Obtenemos datos de las salidas de ssp
+        # Get the data from the ssp outputs
         data = self.ssp_data.copy()
 
         #add calculation of total TLUs to data
@@ -211,6 +252,191 @@ class CostBenefits:
         return data
 
     ##############################################
+    #------ CACHES Y VISTAS PRECOMPUTADAS  ------#
+    ##############################################
+
+    def _build_caches(self) -> None:
+        """
+        Load ONCE into memory every configuration table from SQLite
+        (tx_table, cost_factors, transformation_costs, interactions and
+        sector-specific inputs) as pandas DataFrames, and build O(1)
+        dictionaries that replace the repeated ORM queries.
+
+        Also:
+         - precomputes `_diff_var_matches`: a mapping
+           {pattern -> [matching ssp columns]} so that `cb_wrapper` does not
+           have to scan `ssp_list_of_vars` with a regex on every call.
+         - precomputes `_cost_factors_by_name` / `_transformation_costs_by_name`
+           / `_tx_table_by_name`: mappings {output_variable_name -> ORM
+           instance} that replace `session.query(...).filter(...).first()`
+           inside the hot computation path.
+        """
+        sess = self.session
+        bind = sess.bind
+
+        def _df(model):
+            return pd.read_sql(sess.query(model).statement, bind)
+
+        self._cache: Dict[str, pd.DataFrame] = {
+            "tx_table":                   _df(TXTable),
+            "cost_factors":               _df(CostFactor),
+            "transformation_costs":       _df(TransformationCost),
+            "strategy_interactions":      _df(StrategyInteraction),
+            "countries_iso":              _df(CountriesISO),
+            "att_dim_time_period":        _df(AttDimTimePeriod),
+            "att_transformation_code":    _df(AttTransformationCode),
+            "agrc_lvst_productivity_gdp": _df(AgrcLVSTProductivityCostGDP),
+            "agrc_rice_mgmt_tx":          _df(AgrcRiceMGMTTX),
+            "entc_reduce_losses":         _df(ENTCReduceLosses),
+            "ippu_ccs_cost_factor":       _df(IPPUCCSCostFactor),
+            "ippu_fgas_designation":      _df(IPPUFgasDesignation),
+            "lndu_soil_carbon_fraction":  _df(LNDUSoilCarbonFraction),
+            "lvst_enteric_fermentation":  _df(LVSTEntericFermentationTX),
+            "lvst_tlu_conversion":        _df(LVSTTLUConversion),
+            "pflo_transition_new_diets":  _df(PFLOTransitionNewDiets),
+            "wali_sanitation_class":      _df(WALISanitationClassificationSP),
+        }
+
+        # Cache ORM records to replace get_cb_var_fields() and the repeated
+        # reads inside cb_wrapper. We keep the actual ORM instances so the
+        # existing interface is preserved 100% (including the `tx_table`
+        # relationship).
+        self._tx_table_by_name: Dict[str, TXTable] = {
+            r.output_variable_name: r for r in sess.query(TXTable).all()
+        }
+        self._cost_factors_by_name: Dict[str, CostFactor] = {
+            r.output_variable_name: r for r in sess.query(CostFactor).all()
+        }
+        self._transformation_costs_by_name: Dict[str, TransformationCost] = {
+            r.output_variable_name: r for r in sess.query(TransformationCost).all()
+        }
+
+        # Precompute the `difference_variable` matches so we do not pay a
+        # regex scan over ssp_list_of_vars on every cb_wrapper call.
+        self._diff_var_matches: Dict[str, List[str]] = {}
+
+        diff_patterns: List[str] = []
+        diff_patterns.extend(
+            self._cache["cost_factors"]["difference_variable"].dropna().tolist()
+        )
+        diff_patterns.extend(
+            self._cache["transformation_costs"]["difference_variable"].dropna().tolist()
+        )
+
+        for pat in set(diff_patterns):
+            if pat is None:
+                continue
+            # Same treatment as the original code: replace `*` with `.*` and
+            # compile as regex. Patterns may also use `|` as an alternative
+            # (e.g. several `energy_consumption_trns_*` columns), so we ALWAYS
+            # compile — a plain exact lookup is not enough.
+            rx = re.compile(pat.replace("*", ".*"))
+            self._diff_var_matches[pat] = [
+                c for c in self.ssp_list_of_vars if rx.match(c)
+            ]
+
+        # Useful precomputed column lists for specific functions.
+        self._fgases_vars = [
+            v for v in self.ssp_list_of_vars
+            if v.startswith("emission_co2e_")
+            and not ("_co2_" in v or "_n2o_" in v or "_ch4_" in v or "_subsector_" in v)
+        ]
+        _fgtv_rx = re.compile(r"emission_co2e_.*_fgtv_fuel_.*")
+        self._fgtv_vars = [v for v in self.ssp_list_of_vars if _fgtv_rx.match(v)]
+        self._ccs_fraction_vars = [
+            v for v in self.ssp_list_of_vars
+            if v.startswith("frac_ippu_production_with_co2_capture_")
+        ]
+
+    def _build_strategy_views(self) -> None:
+        """
+        Partition `ssp_data` by `strategy_code` once. All `cb_*` functions
+        read these views instead of repeatedly calling
+        `self.ssp_data.copy()` or `ssp_data[ssp_data.strategy_code==X]`.
+        pandas does not guarantee the groupby chunks to be views, but since
+        downstream functions never mutate these DataFrames in place (they
+        always create new DataFrames through merge/assign), the cached
+        reference is safe.
+        """
+        # Important: `reset_index(drop=True)` so the DataFrames have
+        # contiguous indices 0..N-1, just like the original code that did
+        # `data[mask].reset_index(drop=True)`. Several downstream functions
+        # (e.g. `cb_manure_management_cost`) concatenate along axis 1
+        # assuming positional alignment.
+        self._ssp_by_strategy: Dict[str, pd.DataFrame] = {
+            sc: g.reset_index(drop=True)
+            for sc, g in self.ssp_data.groupby("strategy_code", sort=False)
+        }
+
+    def _get_ssp_slice(self, strategy_code: str) -> pd.DataFrame:
+        """Return the precomputed view for the given strategy."""
+        if not hasattr(self, "_ssp_by_strategy"):
+            self._build_strategy_views()
+        return self._ssp_by_strategy[strategy_code]
+
+    def _invalidate_caches(self) -> None:
+        """
+        Invalidate caches after the user mutates the configuration database
+        (load_cb_parameters, update_all_*_table, etc.). Does not touch
+        `_ssp_by_strategy` because ssp_data does not change.
+        """
+        self._build_caches()
+
+    def insert_cb_records(
+                self,
+                table_name: str,
+                records: Union[pd.DataFrame, List[Dict[str, Any]]],
+        ) -> None:
+        """
+        Insert rows into any configuration table of the package without
+        going through the Excel round-trip. Useful for registering new
+        transformations, cost factors, interactions, etc. from code.
+
+        Parameters
+        ----------
+        table_name : str
+            Physical table name (the `__tablename__` of the SQLAlchemy
+            model). Valid values: `attribute_transformation_code`,
+            `tx_table`, `transformation_costs`, `cost_factors`,
+            `strategy_interactions`, `countries_by_iso`,
+            `attribute_dim_time_period`, `agrc_lvst_productivity_costgdp`,
+            `agrc_rice_mgmt_tx`, `entc_reduce_losses_cost_file`,
+            `ippu_ccs_cost_factors`, `ippu_fgas_designations`,
+            `LNDU_soil_carbon_fractions`, `LVST_enteric_fermentation_tx`,
+            `lvst_tlu_conversions`, `pflo_transition_to_new_diets`,
+            `wali_sanitation_classification`.
+        records : pd.DataFrame | list[dict]
+            Rows to add. Columns must match the table schema.
+
+        Notes
+        -----
+        - Inserts are append-only (existing rows are not replaced). If a
+          primary key already exists, SQLAlchemy raises an IntegrityError.
+        - After inserting, the internal cache is invalidated so that the
+          next `compute_*` calls see the new records.
+        """
+        if isinstance(records, list):
+            df = pd.DataFrame(records)
+        elif isinstance(records, pd.DataFrame):
+            df = records
+        else:
+            raise TypeError(
+                "records must be pd.DataFrame or list[dict]; "
+                f"got {type(records).__name__}"
+            )
+
+        if df.empty:
+            return
+
+        df.to_sql(
+            table_name,
+            self.session.bind,
+            if_exists="append",
+            index=False,
+        )
+        self._invalidate_caches()
+
+    ##############################################
 	#------------- UTILITIES   ------------#
 	##############################################
 
@@ -226,9 +452,9 @@ class CostBenefits:
     #Get a column of data from a wide data table and return it as long for a single strategy
     def cb_get_data_from_wide_to_long(
                 self,
-                data : pd.DataFrame, 
-                strategy_code : List[str], 
-                variables : List[str]
+                data : pd.DataFrame,
+                strategy_code : Union[str, List[str]],
+                variables : Union[str, List[str]]
         ) -> pd.DataFrame:
 
         if not isinstance(variables, list):
@@ -237,12 +463,28 @@ class CostBenefits:
         if not isinstance(strategy_code, list):
             strategy_code = [strategy_code]
 
-        data_wide = data[data["strategy_code"].isin(strategy_code)][SSP_GLOBAL_SIMULATION_IDENTIFIERS + variables].reset_index(drop = True)
-        
-        data_long = data_wide.melt(id_vars=SSP_GLOBAL_SIMULATION_IDENTIFIERS)
-    
+        # Fast path: if the caller passes `self.ssp_data`, use the
+        # precomputed per-strategy views and avoid running a boolean mask
+        # over the full DataFrame.
+        use_views = (
+            data is self.ssp_data
+            and hasattr(self, "_ssp_by_strategy")
+        )
 
-        return data_long  
+        cols = SSP_GLOBAL_SIMULATION_IDENTIFIERS + variables
+
+        if use_views:
+            if len(strategy_code) == 1:
+                data_wide = self._ssp_by_strategy[strategy_code[0]][cols]
+            else:
+                data_wide = pd.concat(
+                    [self._ssp_by_strategy[s][cols] for s in strategy_code],
+                    ignore_index=False,
+                )
+        else:
+            data_wide = data[data["strategy_code"].isin(strategy_code)][cols]
+
+        return data_wide.melt(id_vars=SSP_GLOBAL_SIMULATION_IDENTIFIERS)
 
     def mapping_strategy_specific_functions(
                         self,
@@ -303,15 +545,17 @@ class CostBenefits:
                         cb_var_name : str,
                         ) -> Union[TransformationCost, CostFactor]:
 
-        # Identificamos qué tipo de factor de costo es
-        tx_query = self.session.query(TXTable).filter(TXTable.output_variable_name == cb_var_name).first() 
+        # Lookup O(1) contra los diccionarios cacheados (reemplaza 2 queries SQL
+        # por cada variable por cada estrategia).
+        tx_row = self._tx_table_by_name.get(cb_var_name)
+        if tx_row is None:
+            return None
 
-        if tx_query.cost_type == "system_cost":
-            
-            return self.session.query(CostFactor).filter(CostFactor.output_variable_name == cb_var_name).first() 
-        
-        elif tx_query.cost_type == "transformation_cost":
-            return self.session.query(TransformationCost).filter(TransformationCost.output_variable_name == cb_var_name).first() 
+        if tx_row.cost_type == "system_cost":
+            return self._cost_factors_by_name.get(cb_var_name)
+        elif tx_row.cost_type == "transformation_cost":
+            return self._transformation_costs_by_name.get(cb_var_name)
+        return None
         
 
     def compute_cost_benefit_from_variable(
@@ -325,19 +569,19 @@ class CostBenefits:
                         cb_var_fields : Union[Dict[str, Union[float,int,str]], None] = None
                         ) -> pd.DataFrame:
 
-        ## Obteniendo registro de la db
+        ## Fetch the record from the cache.
         cb_orm = self.get_cb_var_fields(cb_var_name)
 
-        ## Agregamos como atributo la estrategia a comparar
+        ## Attach the strategy to compare against.
         if strategy_code_tx : cb_orm.strategy_code_tx = strategy_code_tx
 
-        ## Agregamos como atributo la estrategia baseline
-        if strategy_code_base : 
+        ## Attach the baseline strategy.
+        if strategy_code_base :
             cb_orm.strategy_code_base = strategy_code_base
         else:
-            cb_orm.strategy_code_base = self.strategy_code_base 
+            cb_orm.strategy_code_base = self.strategy_code_base
 
-        ## Actualizamos los campos del registro si recibimos el diccionario cb_var_fields
+        ## Update the record fields if a cb_var_fields dict was received.
         if isinstance(cb_var_fields, dict):
             self.update_cost_factor_register(cb_var_name = cb_var_name, 
                                         cb_var_fields = cb_var_fields)
@@ -348,7 +592,7 @@ class CostBenefits:
 
         if cb_orm.tx_table.cost_type == "system_cost":
             if verbose:
-                print("La variable se evalúa en System Cost")
+                print("The variable is evaluated in System Cost")
                 #print(f"                       {cb_orm.diff_var}")
 
             
@@ -358,7 +602,7 @@ class CostBenefits:
             if cb_orm.cb_function=="cb:enfu:fuel_cost:X:X":
                 cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
-            # Aplicamos la función de costo
+            # Apply the cost function
             if data_baseline and data_tx:
                 df_cb_results_var = self.mapping_strategy_specific_functions(cb_orm.cb_function,
                                                                              cb_orm, 
@@ -370,11 +614,11 @@ class CostBenefits:
             return df_cb_results_var
         elif cb_orm.tx_table.cost_type == "transformation_cost":
             
-            print("La variable se evalúa en Transformation Cost")
-            
+            print("The variable is evaluated in Transformation Cost")
+
             if self.tx_in_strategy(cb_orm.transformation_code, cb_orm.strategy_code_tx):
 
-                # Aplicamos la función de costo
+                # Apply the cost function
                 if data_baseline and data_tx:
                     df_cb_results_var = self.mapping_strategy_specific_functions(cb_orm.cb_function,
                                                                                  cb_orm,
@@ -385,7 +629,7 @@ class CostBenefits:
 
                 return df_cb_results_var
             else:
-                print("La TX no se encuentra en la estrategia")
+                print("The TX is not present in the strategy")
                 return pd.DataFrame()
 
     ######################################################
@@ -395,20 +639,20 @@ class CostBenefits:
     def get_all_cost_factor_variables(
                         self
         ) -> pd.DataFrame:
-        
-        return pd.read_sql(self.session.query(TXTable).statement, self.session.bind) 
+
+        return self._cache["tx_table"].copy()
 
     def get_cost_factors(
                         self
         ) -> pd.DataFrame:
-        
-        return pd.read_sql(self.session.query(CostFactor).statement, self.session.bind) 
+
+        return self._cache["cost_factors"].copy()
 
     def get_technical_costs(
                         self
         ) -> pd.DataFrame:
 
-        return pd.read_sql(self.session.query(TransformationCost).statement, self.session.bind) 
+        return self._cache["transformation_costs"].copy()
     
     def update_all_cost_factors_table(
                         self,
@@ -419,14 +663,14 @@ class CostBenefits:
         self.session.query(CostFactor).delete()
         self.session.commit()
 
-        # Update records with the new dataframe
-        data_fields = new_cost_factors_table.columns
-
-        self.session.bulk_save_objects(
-                    [CostFactor(**{tb_fields : record_fields for tb_fields,record_fields in zip(data_fields, record)}) for record in new_cost_factors_table.to_records(index = False) ]
+        # Bulk insert via SQLAlchemy Core (faster than instantiating one
+        # ORM object per row).
+        new_cost_factors_table.to_sql(
+            "cost_factors", self.session.bind, if_exists="append", index=False
         )
 
-        self.session.commit()
+        # Invalidate caches because the records changed.
+        self._invalidate_caches()
 
 
     def update_all_technical_costs_table(
@@ -438,30 +682,34 @@ class CostBenefits:
         self.session.query(TransformationCost).delete()
         self.session.commit()
 
-        # Update records with the new dataframe
-        data_fields = new_transformation_costs_table.columns
-
-        self.session.bulk_save_objects(
-                    [TransformationCost(**{tb_fields : record_fields for tb_fields,record_fields in zip(data_fields, record)}) for record in new_transformation_costs_table.to_records(index = False) ]
+        # Bulk insert via SQLAlchemy Core.
+        new_transformation_costs_table.to_sql(
+            "transformation_costs", self.session.bind, if_exists="append", index=False
         )
 
-        self.session.commit()
+        # Invalidate caches because the records changed.
+        self._invalidate_caches()
 
 
-    def update_cost_factor_register(self, 
+    def update_cost_factor_register(self,
                                     cb_var_name : str,
                                     cb_var_fields : Dict[str, Union[float,int,str]]) -> None:
-        # Identificamos qué tipo de factor de costo es
-        tx_query = self.session.query(TXTable).filter(TXTable.output_variable_name == cb_var_name).first() 
+        # Cache lookup instead of SQL query
+        tx_row = self._tx_table_by_name.get(cb_var_name)
+        if tx_row is None:
+            return
 
-        if tx_query.cost_type == "system_cost":
+        if tx_row.cost_type == "system_cost":
             stmt = update(CostFactor).where(CostFactor.output_variable_name == cb_var_name).values(**cb_var_fields)
             self.session.execute(stmt)
             self.session.commit()
-        elif tx_query.cost_type == "transformation_cost":
-            stmt = update(TransformationCost).where(CostFactor.output_variable_name == cb_var_name).values(**cb_var_fields)
+        elif tx_row.cost_type == "transformation_cost":
+            stmt = update(TransformationCost).where(TransformationCost.output_variable_name == cb_var_name).values(**cb_var_fields)
             self.session.execute(stmt)
             self.session.commit()
+
+        # Invalidate caches because a record changed.
+        self._invalidate_caches()
         
 
 
@@ -475,17 +723,20 @@ class CostBenefits:
                         strategy_code_base : Union[str,None] = None,
                         verbose : bool = True
                         ) -> pd.DataFrame:
-        ## Get cb variables that will be evaluated on system cost
-        system_cost_cb_vars = self.session.query(TXTable).filter(TXTable.cost_type == "system_cost").options(load_only(TXTable.output_variable_name)).all()
+        ## Get cb variables that will be evaluated on system cost (cache lookup)
+        tx_df = self._cache["tx_table"]
+        system_cost_vars = tx_df.loc[
+            tx_df["cost_type"] == "system_cost", "output_variable_name"
+        ].tolist()
 
         accumulate_system_costs = []
 
-        for cb_var in system_cost_cb_vars:
+        for cb_var_name in system_cost_vars:
             accumulate_system_costs.append(
-                self.compute_cost_benefit_from_variable(cb_var.output_variable_name, strategy_code_tx, verbose = verbose)
-           )
+                self.compute_cost_benefit_from_variable(cb_var_name, strategy_code_tx, verbose=verbose)
+            )
 
-        return pd.concat(accumulate_system_costs, ignore_index = True)
+        return pd.concat(accumulate_system_costs, ignore_index=True)
     
     def compute_system_cost_for_all_strategies(
                         self,
@@ -520,15 +771,15 @@ class CostBenefits:
                         strategy_code_base : Union[str,None] = None,
                         verbose : bool = True
                         ) -> pd.DataFrame:
-        ## Get cb variables that will be evaluated on system cost
-        technical_cost_cb = self.session.query(TransformationCost).all()
-        
-        ## Get mapping between cb_var by technical cost and transformation 
-        cb_tech_cost_mapping_to_tx = pd.read_sql(self.session.query(TransformationCost).statement, self.session.bind) 
-        cb_tech_cost_mapping_to_tx = dict(cb_tech_cost_mapping_to_tx[["output_variable_name", "transformation_code"]].to_records(index = False))
-        
+        ## Get cb variables that will be evaluated on technical cost (cache)
+        tc_df = self._cache["transformation_costs"]
+
+        cb_tech_cost_mapping_to_tx = dict(
+            tc_df[["output_variable_name", "transformation_code"]].to_records(index=False)
+        )
+
         ## Get all transformations in technical cost
-        all_tx_in_technical_cost = [i.transformation_code for i in technical_cost_cb]
+        all_tx_in_technical_cost = tc_df["transformation_code"].tolist()
 
         ## Get transformation inside on strategy_code_tx
         tx_technical_cost_in_strategy = list(set(all_tx_in_technical_cost).intersection(self.strategy_to_txs[strategy_code_tx]))
@@ -580,71 +831,87 @@ class CostBenefits:
                         res : pd.DataFrame,
         ) -> pd.DataFrame:
 
-        # Get interaction table
-        interactions = pd.read_sql(self.session.query(StrategyInteraction).statement, self.session.bind)
+        # Interaction table from the cache (no SQL on every call).
+        interactions = self._cache["strategy_interactions"]
+        if interactions.empty:
+            return res
 
-        #get the list of interactions
-        list_of_interactions = interactions["interaction_name"].unique()
+        # Precompute the groupby by interaction name once (the previous
+        # implementation called `interactions.query("interaction_name==X")`
+        # on every iteration — O(S*I) scans over the whole table).
+        interaction_groups = {
+            name: grp for name, grp in interactions.groupby("interaction_name", sort=False)
+        }
 
         #get the strategies in the results file
         strategies = res["strategy_code"].unique()
 
+        # Collect the subsets to replace in a list instead of reassigning
+        # `res = pd.concat([res, ...])` inside the loop, which is quadratic.
+        # We perform a single concat at the end.
+        rows_to_drop_masks = []
+        replacement_frames = []
 
         for strategy_code in strategies:
-            # Get transformations in the strategy definition
             tx_in_strategy = self.strategy_to_txs[strategy_code]
-            
-            #for each interaction
-            for interaction in list_of_interactions:
-                #transformations that interact
-                tx_interacting = interactions.query(f"interaction_name=='{interaction}'")
-                tx_in_interaction = tx_interacting["transformation_code"].unique()
-                tx_in_both = list(set(tx_in_interaction).intersection(tx_in_strategy))
 
-                #only count the transfomrations actully in the strategy
-                tx_interacting = tx_interacting[tx_interacting["transformation_code"].isin(tx_in_both)]
+            for interaction, tx_interacting_full in interaction_groups.items():
+                # Keep only rows whose tx belongs to the strategy.
+                mask_strategy_tx = tx_interacting_full["transformation_code"].isin(tx_in_strategy)
+                tx_interacting = tx_interacting_full[mask_strategy_tx]
 
-                if SSP_PRINT_STRATEGIES: 
+                if SSP_PRINT_STRATEGIES:
                     print(f"Resolving Interactions in {interaction} : {', '.join(tx_interacting['transformation_code'].to_list())} ")
 
                 if tx_interacting.shape[0] == 0:
                     if SSP_PRINT_STRATEGIES:
                         print(f"No interactions, skipping... {strategy_code}")
-                        continue
+                    continue
 
                 # Rescale
-                tx_rescale = tx_interacting.groupby("transformation_code")\
-                                            .agg({"relative_effect" : "mean"})\
-                                            .reset_index()\
-                                            .rename(columns = {"relative_effect":"original_scalar"})
-                
+                tx_rescale = (tx_interacting.groupby("transformation_code")
+                                            .agg({"relative_effect": "mean"})
+                                            .reset_index()
+                                            .rename(columns={"relative_effect": "original_scalar"}))
+
                 new_sum = tx_rescale["original_scalar"].sum()
-                tx_rescale["newscalar"] = tx_rescale["original_scalar"]/new_sum
+                tx_rescale["newscalar"] = tx_rescale["original_scalar"] / new_sum
 
-                #update the original scalars in the intracting tx
-                tx_interacting = tx_interacting.merge(right=tx_rescale, on = "transformation_code")
-                tx_interacting["strategy_code"] = strategy_code
+                tx_interacting = tx_interacting.merge(right=tx_rescale, on="transformation_code")
+                tx_interacting = tx_interacting.assign(strategy_code=strategy_code)
 
-                #apply these scalars to the data
-                res_subset = res[(res["strategy_code"] == strategy_code) & (res["variable"].isin(tx_interacting["variable"]))]
-                res_subset = res_subset.merge(right=tx_interacting, on = ["strategy_code", "variable"], suffixes=['', '.int'])
-                res_subset.loc[res_subset["scale_variable"]==0.0, "newscalar"] = 1.0
+                # Subset de `res` a re-escalar.
+                vars_of_interest = tx_interacting["variable"].unique()
+                mask = (res["strategy_code"] == strategy_code) & (res["variable"].isin(vars_of_interest))
+                if not mask.any():
+                    continue
 
-                res_subset["value"] = res_subset["value"] * res_subset["newscalar"]
-                res_subset["difference_value"] = res_subset["difference_value"] * res_subset["newscalar"]
+                res_subset = res[mask].merge(
+                    right=tx_interacting,
+                    on=["strategy_code", "variable"],
+                    suffixes=("", ".int"),
+                )
+                res_subset.loc[res_subset["scale_variable"] == 0.0, "newscalar"] = 1.0
 
-                res_subset["variable_value_baseline"] = res_subset["variable_value_baseline"] * res_subset["newscalar"]
-                res_subset["variable_value_pathway"] = res_subset["variable_value_pathway"] * res_subset["newscalar"]
+                newscalar = res_subset["newscalar"]
+                res_subset["value"] = res_subset["value"] * newscalar
+                res_subset["difference_value"] = res_subset["difference_value"] * newscalar
+                res_subset["variable_value_baseline"] = res_subset["variable_value_baseline"] * newscalar
+                res_subset["variable_value_pathway"] = res_subset["variable_value_pathway"] * newscalar
 
-                #make a replacement dataset
-                res_for_replacement = res_subset[SSP_GLOBAL_COLNAMES_OF_RESULTS]
+                rows_to_drop_masks.append(mask)
+                replacement_frames.append(res_subset[SSP_GLOBAL_COLNAMES_OF_RESULTS])
 
-                #remove the other rows from the dataset
-                res = res[~((res["strategy_code"] == strategy_code) & (res["variable"].isin(tx_interacting["variable"])))]
+        if not replacement_frames:
+            return res
 
-                res = pd.concat([res, res_for_replacement], ignore_index = True)
+        # OR-combine every mask and perform ONE drop + ONE concat at the end.
+        combined_drop_mask = rows_to_drop_masks[0].copy()
+        for m in rows_to_drop_masks[1:]:
+            combined_drop_mask |= m
 
-        return res
+        res_kept = res[~combined_drop_mask]
+        return pd.concat([res_kept] + replacement_frames, ignore_index=True)
 
     ##############################################
 	#---------- SHIFT COSTS METHOD  -------------#
@@ -656,7 +923,9 @@ class CostBenefits:
         ) -> pd.DataFrame:
 
         #SHIFT any stray costs incurred from 2015 to 2025 to 2025 and 2035
-        res_pre2025 = res.query(f"time_period<{SSP_GLOBAL_TIME_PERIOD_TX_START}")#get the subset of early costs
+        # Explicit .copy() to avoid SettingWithCopyWarning: query() returns
+        # a view and we assign columns to it right afterwards.
+        res_pre2025 = res.query(f"time_period<{SSP_GLOBAL_TIME_PERIOD_TX_START}").copy()
         res_pre2025["variable"] = res_pre2025["variable"] + "_shifted" + (res_pre2025["time_period"]+SSP_GLOBAL_TIME_PERIOD_0).astype(str)#create a new variable so they can be recognized as shifted costs
         res_pre2025["time_period"] = res_pre2025["time_period"]+SSP_GLOBAL_TIME_PERIOD_TX_START #shift the time period
 
@@ -693,64 +962,69 @@ class CostBenefits:
 
 
     def load_cb_parameters(
-        self, 
+        self,
         FP : str
         ) -> None:
-        
+
         # Test if file exists
-        if os.path.isfile(FP):
-            print("Cargamos configuración de archivo excel")
+        if not os.path.isfile(FP):
+            warnings.warn("CB factors file not found\nThe default configuration will be used")
+            return
 
-            ## Diccionario que mapea los nombres de las pestañas con su respectiva tabla en la base de datos
-            cb_model_mapping = {"tx_table" : TXTable,
-                                "transformation_costs" : TransformationCost,
-                                "strategy_interactions" : StrategyInteraction,
-                                "cost_factors" : CostFactor,
-                                "countries_by_iso" : CountriesISO,
-                                "attribute_dim_time_period" : AttDimTimePeriod,
-                                "attribute_transformation_code" : AttTransformationCode,
-                                "agrc_lvst_productivity_costgdp" : AgrcLVSTProductivityCostGDP,
-                                "agrc_rice_mgmt_tx" : AgrcRiceMGMTTX,
-                                "entc_reduce_losses_cost_file" : ENTCReduceLosses,
-                                "ippu_ccs_cost_factors" : IPPUCCSCostFactor,
-                                "ippu_fgas_designations" : IPPUFgasDesignation,
-                                "LNDU_soil_carbon_fractions" : LNDUSoilCarbonFraction,
-                                "LVST_enteric_fermentation_tx" : LVSTEntericFermentationTX,
-                                "lvst_tlu_conversions" : LVSTTLUConversion,
-                                "pflo_transition_to_new_diets" : PFLOTransitionNewDiets,
-                                "wali_sanitation_classification" : WALISanitationClassificationSP}
+        print("Loading configuration from Excel file (fast path)")
 
-            ## Iniciamos una nueva sesión en el objeto 
-            engine = create_engine('sqlite:///:memory:')
+        ## Mapping {sheet_name -> __tablename__ of the SQLAlchemy schema}.
+        cb_model_mapping = {
+            "tx_table": "tx_table",
+            "transformation_costs": "transformation_costs",
+            "strategy_interactions": "strategy_interactions",
+            "cost_factors": "cost_factors",
+            "countries_by_iso": "countries_by_iso",
+            "attribute_dim_time_period": "attribute_dim_time_period",
+            "attribute_transformation_code": "attribute_transformation_code",
+            "agrc_lvst_productivity_costgdp": "agrc_lvst_productivity_costgdp",
+            "agrc_rice_mgmt_tx": "agrc_rice_mgmt_tx",
+            "entc_reduce_losses_cost_file": "entc_reduce_losses_cost_file",
+            "ippu_ccs_cost_factors": "ippu_ccs_cost_factors",
+            "ippu_fgas_designations": "ippu_fgas_designations",
+            "LNDU_soil_carbon_fractions": "LNDU_soil_carbon_fractions",
+            "LVST_enteric_fermentation_tx": "LVST_enteric_fermentation_tx",
+            "lvst_tlu_conversions": "lvst_tlu_conversions",
+            "pflo_transition_to_new_diets": "pflo_transition_to_new_diets",
+            "wali_sanitation_classification": "wali_sanitation_classification",
+        }
 
-            Session = sessionmaker(bind=engine)
+        ## Open the workbook ONCE (`sheet_name=None` returns a dict with
+        ## every sheet already parsed). This avoids opening and parsing
+        ## the file 17 times.
+        all_sheets = pd.read_excel(FP, engine="openpyxl", sheet_name=None)
 
-            self.session = Session()
+        ## New in-memory session + SQLAlchemy schema (no ORM instances).
+        engine = create_engine("sqlite:///:memory:")
+        Base = declarative_base()
+        update_db_schema(Base)
+        Base.metadata.create_all(engine)
 
-            Base = declarative_base()
+        ## Bulk load via `to_sql` (SQLAlchemy Core path). Much faster than
+        ## instantiating one ORM object per row + bulk_save_objects.
+        with engine.begin() as conn:
+            for sheet_name, tb_name in cb_model_mapping.items():
+                df_tb = all_sheets.get(sheet_name)
+                if df_tb is None:
+                    warnings.warn(
+                        f"Sheet '{sheet_name}' does not exist in {FP}; skipping"
+                    )
+                    continue
+                df_tb.to_sql(tb_name, conn, if_exists="append", index=False)
 
-            update_db_schema(Base)
+        Session = sessionmaker(bind=engine)
+        self.session = Session()
 
-            Base.metadata.create_all(engine)
-            
-            ## Poblamod cada tabla con los datos del archivo excel
+        # Rebuild caches against the new in-memory session, otherwise the
+        # cached ORM instances would be detached.
+        self._build_caches()
 
-            for sheet_name,tb_model in cb_model_mapping.items():
-                df_tb = pd.read_excel(FP, engine = "openpyxl", sheet_name = sheet_name)
-                data_fields = df_tb.columns
-
-                self.session.bulk_save_objects(
-                    [tb_model(**{tb_fields : record_fields for tb_fields,record_fields in zip(data_fields, record)}) for record in df_tb.to_records(index = False) ]
-                )
-
-            self.session.commit()
-
-
-            print("Se actualizó la base de datos")
-
-
-        else:
-            warnings.warn("El archivo de factores de CB no fue encontrado\nSe usará la configuración default")
+        print("Database updated")
 
 
 
@@ -779,8 +1053,11 @@ class CostBenefits:
                 datap_base = data_baseline[SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
                 datap_tx   = data_tx[SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
                 #get the data tables and merge them
                 datap_base = data[data["strategy_code"]==cb_orm.strategy_code_base][SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
                 datap_tx   = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
@@ -805,7 +1082,7 @@ class CostBenefits:
 
             data_merged["value"] = data_merged["difference_value"]*cb_orm.multiplier*cb_orm.annual_change**data_merged["time_period_for_multiplier_change"]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
             data_merged['variable_value_baseline'] =  data_merged[f"{cb_orm.diff_var}{base_suffix}"]
             data_merged['variable_value_pathway'] = data_merged[f"{cb_orm.diff_var}{tx_suffix}"]
 
@@ -835,11 +1112,14 @@ class CostBenefits:
         if cb_orm.cb_function == 'cb_scale_variable_in_strategy':
             
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
             id_vars  = ['region','time_period', 'strategy_code', 'future_id']
             
@@ -852,14 +1132,14 @@ class CostBenefits:
             data_merged["time_period_for_multiplier_change"] = np.maximum(0,data_merged["time_period"]-SSP_GLOBAL_TIME_PERIOD_2023)
             data_merged["values"] = data_merged["difference"]*cb_orm.multiplier*cb_orm.annual_change**data_merged["time_period_for_multiplier_change"]  
 
-            tmp = data_merged[id_vars]
+            tmp = data_merged[id_vars].copy()
             tmp["difference_variable"] = cb_orm.diff_var
             tmp["difference_value"] = data_merged["difference"]
             tmp["variable"] = cb_orm.output_variable_name
             tmp["value"] = data_merged["values"]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             tmp['variable_value_baseline'] = 0
             if "difference" in list(tmp.columns):
                 tmp['variable_value_pathway'] = tmp["difference_value"]
@@ -900,11 +1180,14 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_fraction_change":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
             
             invert = cb_orm.arg2
             frac_var = cb_orm.arg1
@@ -941,8 +1224,8 @@ class CostBenefits:
             #any divide-by-zero NAs from our earlier division gets a 0
             data_merged_results = data_merged_results.replace(np.nan, 0.0)
             
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             data_merged_results['variable_value_baseline'] = 0 
             data_merged_results['variable_value_pathway'] = data_merged["difference_value"]
 
@@ -964,20 +1247,19 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_entc_reduce_losses":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
-            #get the loss file
-            cb_transmission_loss_costs = pd.read_sql(self.session.query(ENTCReduceLosses).statement, self.session.bind) 
-
-            #map ISO3 to the reigons
-            country_codes = pd.read_sql(self.session.query(CountriesISO).statement, self.session.bind)
-
-            # merge dataframes
-            cb_transmission_loss_costs = cb_transmission_loss_costs.merge(right = country_codes, on = "iso_code3")
+            # Cache lookups (sin SQL por llamada)
+            cb_transmission_loss_costs = self._cache["entc_reduce_losses"].merge(
+                right=self._cache["countries_iso"], on="iso_code3"
+            )
         
             data_strategy = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, cb_orm.diff_var)
 
@@ -988,8 +1270,8 @@ class CostBenefits:
             data_output["difference_variable"] = 'N/A (constant annual cost)'
             data_output["difference_value"] = data_output["annual_investment_USD"]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline y en el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case both baseline and pathway values are set to zero.
             data_output['variable_value_baseline'] = 0 
             data_output['variable_value_pathway'] = 0
 
@@ -1013,11 +1295,14 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_ippu_clinker":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)                
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
                 #get the data tables and merge them
                 data_baseline = data[data["strategy_code"]==cb_orm.strategy_code_base][SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
                 data_tx   = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + [cb_orm.diff_var]].reset_index(drop = True)
@@ -1060,10 +1345,10 @@ class CostBenefits:
             data_merged["value"] = data_merged["difference_value"]*cb_orm.multiplier
             
                 
-            data_output = data_merged[diff_clinker.columns.to_list()]
+            data_output = data_merged[diff_clinker.columns.to_list()].copy()
             
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             data_output['variable_value_baseline'] = 0 
 
             if "difference_value"in list(data_merged.columns):
@@ -1088,16 +1373,17 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_ippu_florinated_gases":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
-            #get all the variables with florinated gases
-            #use nomenclature "emission_co2e_NAMEOFGAS_ippu_" where name of gas contains an "f"
-            emissions_vars = [i for i in self.ssp_list_of_vars if i.startswith('emission_co2e_')]
-            fgases = [i for i in emissions_vars if not ("_co2_" in i or "_n2o_" in i or "_ch4_" in i or "_subsector_" in i)]
+            #get all the variables with florinated gases (precomputado en cache)
+            fgases = self._fgases_vars
 
             #sum up for both strategies
             data_strategy = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, fgases)
@@ -1120,7 +1406,7 @@ class CostBenefits:
         
             data_fgases_merged = data_fgases_merged[["region","time_period","strategy_code", "difference_variable", "difference_value","variable","value"]]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
             data_fgases_merged['variable_value_baseline'] = data_fgases_merged["difference_value.base"]
             data_fgases_merged['variable_value_pathway'] = data_fgases_merged["difference_value"]
 
@@ -1148,33 +1434,38 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_fgtv_abatement_costs":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
                     
             #(1) FUGITIVE EMISSIONS INTENSITY
             energy_vars = ['energy_demand_enfu_total_fuel_coal', 'energy_demand_enfu_total_fuel_oil', 'energy_demand_enfu_total_fuel_natural_gas']
-            fgtv_vars = [string for string in self.ssp_list_of_vars if  re.match(re.compile('emission_co2e_.*_fgtv_fuel_.*'), string)]
+            # Precomputed in cache (the previous code scanned ssp_list_of_vars on every call).
+            fgtv_vars = self._fgtv_vars
 
             #1. Get the fugitive emissions per PJ of coal and oil together in the baseline
+            # Vectorized string ops (antes usaban .apply con lambda).
             energy = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, energy_vars)
-            energy["fuel"] = energy["variable"].apply(lambda x : x.replace('energy_demand_enfu_total_', ''))
+            energy["fuel"] = energy["variable"].str.replace("energy_demand_enfu_total_", "", regex=False)
             fgtv = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, fgtv_vars)
-            fgtv["fuel"] = fgtv["variable"].apply(lambda x : x.split("_fgtv_")[-1])
+            fgtv["fuel"] = fgtv["variable"].str.rsplit("_fgtv_", n=1).str[-1]
 
             #1.a summarize the emissions by fuel
             vars_to_groupby = ["primary_id", "region", "time_period", "strategy_code", "fuel"]
             fgtv = fgtv.groupby(vars_to_groupby).agg({"value" : "sum"}).reset_index()
 
             data_merged_base = energy.merge(right = fgtv, on = vars_to_groupby, suffixes=('.en_base', '.fg_base'))
-            
+
             #2. Get the fugitive emissions per PJ of coal and oil together in the transformed future
             energy_tx = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, energy_vars)
-            energy_tx["fuel"] = energy_tx["variable"].apply(lambda x : x.replace('energy_demand_enfu_total_', ''))
+            energy_tx["fuel"] = energy_tx["variable"].str.replace("energy_demand_enfu_total_", "", regex=False)
             fgtv_tx = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, fgtv_vars)
-            fgtv_tx["fuel"] = fgtv_tx["variable"].apply(lambda x : x.split("_fgtv_")[-1])
+            fgtv_tx["fuel"] = fgtv_tx["variable"].str.rsplit("_fgtv_", n=1).str[-1]
 
             #2.b summarize the emissions by fuel
             fgtv_tx = fgtv_tx.groupby(vars_to_groupby).agg({"value" : "sum"}).reset_index()
@@ -1200,7 +1491,7 @@ class CostBenefits:
             data_merged["strategy_code"] = data_merged["strategy_code.tx"]
             data_merged["future_id"]= data_merged["future_id.tx"]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
             data_merged['variable_value_baseline'] = data_merged["fgtv_co2e_expected_per_demand"]
             data_merged['variable_value_pathway'] = data_merged["value.fg_tx"] 
 
@@ -1235,16 +1526,19 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_waso_reduce_consumer_facing_food_waste":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
         
             cols_required = ['qty_waso_total_food_produced_tonne', 'qty_agrc_food_produced_lost_sent_to_msw_tonne','factor_waso_waste_per_capita_scalar_food']
 
-            food_waste_data = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + cols_required].reset_index(drop = True)
+            food_waste_data = data[data["strategy_code"]==cb_orm.strategy_code_tx][SSP_GLOBAL_SIMULATION_IDENTIFIERS + cols_required].reset_index(drop = True).copy()
         
             #Get teh consumer food waste amount
             food_waste_data["consumer_food_waste"] = (food_waste_data["qty_waso_total_food_produced_tonne"]) 
@@ -1274,7 +1568,7 @@ class CostBenefits:
             merged_data["variable"] = cb_orm.output_variable_name
             merged_data["value"] = merged_data["difference_value"] * cb_orm.multiplier
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
             merged_data['variable_value_baseline'] = food_waste_data["consumer_food_waste_counterfactual"]
             merged_data['variable_value_pathway'] = food_waste_data["consumer_food_waste"]
 
@@ -1298,14 +1592,17 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_lvst_enteric":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
             #define the strategy as the fractino of livestock receivving this intervention in a particular year
-            tx_definition = pd.read_sql(self.session.query(LVSTEntericFermentationTX).statement, self.session.bind)
+            tx_definition = self._cache["lvst_enteric_fermentation"]
             affected_livestock = tx_definition[tx_definition["application"]>0]
             timesteps = pd.DataFrame({"time_period" : range(SSP_GLOBAL_TIME_PERIODS)})
 
@@ -1330,8 +1627,8 @@ class CostBenefits:
             #data_merged = data_merged[SSP_GLOBAL_COLNAMES_OF_RESULTS]
             data_merged = data_merged[GUARDA_COLS]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             data_merged['variable_value_baseline'] = 0 
 
             if "difference_value" in list(data_merged.columns):
@@ -1356,14 +1653,20 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_agrc_rice_mgmt":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
         
             #define the transformation as the fraction of acres receiivng better rice management
-            tx_definition = pd.read_sql(self.session.query(AgrcRiceMGMTTX).statement, self.session.bind)
+            # Lightweight copy of the cached frame because we are about to
+            # add the `level_of_implementation` column and we do not want to
+            # contaminate the cached version.
+            tx_definition = self._cache["agrc_rice_mgmt_tx"].copy()
             tx_definition["level_of_implementation"] = (1-tx_definition["ef_agrc_anaerobicdom_rice_kg_ch4_ha"])/0.45
             
             rice_management_data = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, cb_orm.diff_var)
@@ -1376,8 +1679,8 @@ class CostBenefits:
             rice_management_data["variable"] = cb_orm.output_variable_name
             rice_management_data["value"] = rice_management_data["difference_value"]*cb_orm.multiplier
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             rice_management_data['variable_value_baseline'] = 0 
             rice_management_data['variable_value_pathway'] = rice_management_data["difference_value"]
 
@@ -1403,21 +1706,25 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_agrc_lvst_productivity":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
             #Get the gdp data
             gdp = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, 'gdp_mmm_usd')
 
-            #Get the fractions for each country
-            gdp_fracs = pd.read_sql(self.session.query(AgrcLVSTProductivityCostGDP).statement, self.session.bind)
-            gdp_fracs = gdp_fracs.rename(columns = {"cost_of_productivity_improvements_pct_gdp" : "cost_frac"})
+            #Get the fractions for each country (cache lookup)
+            gdp_fracs = self._cache["agrc_lvst_productivity_gdp"].rename(
+                columns={"cost_of_productivity_improvements_pct_gdp": "cost_frac"}
+            )
 
-            #country codes
-            country_codes = pd.read_sql(self.session.query(CountriesISO).statement, self.session.bind)
+            #country codes (cache lookup)
+            country_codes = self._cache["countries_iso"]
 
             gdp_fracs = gdp_fracs.merge(right = country_codes, on = "iso_code3")
             gdp_fracs = gdp_fracs.rename(columns = {"REGION" : "region"})
@@ -1439,8 +1746,8 @@ class CostBenefits:
 
             gdp.loc[gdp["time_period"]<SSP_GLOBAL_TIME_PERIOD_TX_START, "value"] = 0
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline y en el pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case both baseline and pathway values are set to zero.
             gdp['variable_value_baseline'] = 0
             gdp['variable_value_pathway'] = 0
             gdp = gdp[SSP_GLOBAL_COLNAMES_OF_RESULTS]
@@ -1466,11 +1773,14 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_pflo_healthier_diets":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
 
             #Get the population
             population = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, ['population_gnrl_rural', 'population_gnrl_urban'])
@@ -1479,8 +1789,8 @@ class CostBenefits:
 
             total_pop = population.groupby(vars_to_groupby).agg({"value" : "sum"}).rename(columns = {"value" : "total_pop"}).reset_index()
 
-            #get the file with popualtion fractions  
-            diet_frac = pd.read_sql(self.session.query(PFLOTransitionNewDiets).statement, self.session.bind)
+            #get the file with popualtion fractions (cache lookup)
+            diet_frac = self._cache["pflo_transition_new_diets"]
             
             data_merged = total_pop.merge(right = diet_frac, on='time_period')
             data_merged["difference_value"] = data_merged["total_pop"]*(1-data_merged["frac_gnrl_w_original_diet"])
@@ -1488,8 +1798,8 @@ class CostBenefits:
             data_merged["variable"] = cb_orm.output_variable_name
             data_merged["value"] = data_merged["difference_value"]*cb_orm.multiplier
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             data_merged['variable_value_baseline'] = 0 
             data_merged['variable_value_pathway'] = data_merged["difference_value"]
 
@@ -1513,14 +1823,17 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_ippu_inen_ccs":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
         
-            #get the fraction reductions in CO2
-            ccs_fraction_vars = [i for i in self.ssp_list_of_vars if i.startswith("frac_ippu_production_with_co2_capture_")]
+            #get the fraction reductions in CO2 (usa la lista precomputada)
+            ccs_fraction_vars = self._ccs_fraction_vars
             ccs_fractions = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, ccs_fraction_vars)
 
             #given the global capture rate, update the application fraction
@@ -1528,7 +1841,12 @@ class CostBenefits:
 
             #get the quantities of production for those variables
             production_vars = [i.replace("frac_ippu_production_with_co2_capture_", "prod_ippu_") + "_tonne" for i in ccs_fraction_vars]
-            ccs_fractions["variable"] = ccs_fractions["variable"].apply(lambda x : x.replace("frac_ippu_production_with_co2_capture_", "prod_ippu_") + "_tonne")
+            # Vectorized str ops en lugar de .apply(lambda).
+            ccs_fractions["variable"] = (
+                ccs_fractions["variable"]
+                .str.replace("frac_ippu_production_with_co2_capture_", "prod_ippu_", regex=False)
+                + "_tonne"
+            )
             prod_qty = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, production_vars)
 
             #merge the two datasets
@@ -1542,16 +1860,16 @@ class CostBenefits:
             data_merged["difference_value"] = data_merged["application_rate"] * data_merged["value"]
             data_merged["difference_variable"] = data_merged["variable"]
 
-            #read the cost definitions
-            ccs_cost_factor = pd.read_sql(self.session.query(IPPUCCSCostFactor).statement, self.session.bind)
+            #read the cost definitions (cache lookup)
+            ccs_cost_factor = self._cache["ippu_ccs_cost_factor"]
             
             data_merged = data_merged.merge(right = ccs_cost_factor, on = 'variable')
 
             data_merged["value"] = data_merged["difference_value"] * data_merged["multiplier"]
             data_merged["variable"] = data_merged["output_variable_name"]
 
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline y pathway
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case both baseline and pathway values are set to zero.
             data_merged['variable_value_baseline'] = 0 
             data_merged['variable_value_pathway'] = 0
 
@@ -1575,11 +1893,14 @@ class CostBenefits:
         if cb_orm.cb_function == "cb_manure_management_cost":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
-                # Obtenemos datos de las salidas de ssp
+                # Get the data from the ssp outputs
                 data = pd.concat([data_baseline, data_tx], ignore_index = True)
             else:
-                # Obtenemos datos de las salidas de ssp
-                data = self.ssp_data.copy()
+                # Get the data from the ssp outputs.
+                # No .copy(): none of the `cb_*` functions mutates this
+                # DataFrame in place; every modification happens on DataFrames
+                # produced by subsequent merge/assign calls.
+                data = self.ssp_data
         
 
             #time_period = range(SSP_GLOBAL_TIME_PERIODS)
@@ -1594,8 +1915,8 @@ class CostBenefits:
             tlus["value"] = tlus["difference_value"]*cb_orm.multiplier
             tlus["variable"] = cb_orm.output_variable_name
             
-            ## Agregamos usado para calcular la diferencia en la estrategia baseline y el pathway
-            ## En este caso, se pondrá cero en el valor del baseline
+            ## Used to compute the difference between the baseline strategy and the pathway.
+            ## In this case the baseline value is set to zero.
             tlus['variable_value_baseline'] = 0
             tlus['variable_value_pathway'] = tlus["difference_value"]
 
