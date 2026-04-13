@@ -118,13 +118,47 @@ class CostBenefits:
                 att_strategy : pd.DataFrame,
         ) -> Dict[str, List[str]]:
 
-        # Obtenemos lista de transformaciones de SSP
+        # Obtenemos lista de transformaciones soportadas por el paquete.
         ssp_txs = [i.transformation_code for i in self.session.query(AttTransformationCode).all()]
 
         original_strategy_to_txs = att_strategy[["strategy_code", "transformation_specification"]].to_records(index = False)
-        
-        strategy_to_txs = {strategy : [get_tx_prefix(transformation, ssp_txs) for transformation in transformations.split("|")] 
-        for strategy,transformations in original_strategy_to_txs}
+
+        # Resolvemos prefijos por transformación. Guardamos los TX no
+        # encontrados en un set para reportarlos una sola vez al final, en
+        # lugar de imprimir una línea por ocurrencia (antes salían cientos
+        # de líneas repetidas cuando una TX aparecía en varias estrategias).
+        missing_txs: set = set()
+        strategy_to_txs: Dict[str, List[str]] = {}
+
+        for strategy, transformations in original_strategy_to_txs:
+            resolved: List[str] = []
+            for transformation in transformations.split("|"):
+                prefix = get_tx_prefix(transformation, ssp_txs)
+                if prefix is None:
+                    missing_txs.add(transformation)
+                else:
+                    resolved.append(prefix)
+            strategy_to_txs[strategy] = resolved
+
+        # Guardamos el set como atributo para que el usuario pueda revisar
+        # cuáles TX no están soportadas por esta versión del paquete.
+        self.missing_transformation_codes = sorted(missing_txs)
+
+        if missing_txs:
+            msg_lines = [
+                "Las siguientes transformaciones NO están en la tabla "
+                "attribute_transformation_code del paquete costs_benefits_ssp "
+                "y por lo tanto serán ignoradas para el cálculo de costos "
+                "y beneficios:",
+            ]
+            msg_lines.extend(f"  - {tx}" for tx in self.missing_transformation_codes)
+            msg_lines.append(
+                "Si alguna de estas transformaciones debe contribuir al cálculo "
+                "de costos, añade el registro correspondiente en la pestaña "
+                "`attribute_transformation_code` del archivo de configuración "
+                "Excel y recarga con `load_cb_parameters`."
+            )
+            warnings.warn("\n".join(msg_lines))
 
         return strategy_to_txs
 
