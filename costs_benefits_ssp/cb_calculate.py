@@ -624,7 +624,20 @@ class CostBenefits:
             
             if cb_orm.cb_var_group == 'wali_sanitation_cost_factors' or cb_orm.cb_var_group == 'wali_benefit_of_sanitation_cost_factors':
                 cb_orm.cb_function = 'cb_difference_between_two_strategies'
-            
+
+            # Activate the detailed per-sector × per-fuel fuel cost factors
+            # (cb:enfu:fuel_cost:<sector>:<fuel>). These rows live in
+            # `cost_factors` with `cb_function='cb_strategy_specific_function'`
+            # which is not implemented, so historically they were dead code.
+            # Their `difference_variable` values are real SSP output columns
+            # (`totalvalue_enfu_fuel_consumed_<sector>_fuel_<fuel>`), so we
+            # rescue them to `cb_difference_between_two_strategies`. The
+            # aggregate `cb:enfu:fuel_cost:X:X` (cb_var_group='enfu_fuel_cost_factors',
+            # note: no `_detail` suffix) is intentionally NOT rescued here to
+            # avoid double counting with the detail.
+            if cb_orm.cb_var_group == 'enfu_fuel_cost_factors_detail':
+                cb_orm.cb_function = 'cb_difference_between_two_strategies'
+
             if cb_orm.cb_function=="cb:enfu:fuel_cost:X:X":
                 cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
