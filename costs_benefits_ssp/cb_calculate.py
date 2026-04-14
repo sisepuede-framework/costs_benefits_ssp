@@ -1416,7 +1416,10 @@ class CostBenefits:
         
             data_strategy_summarized = data_strategy.groupby(["region", "time_period", "strategy_code"]).agg({"value" : "sum"}).rename(columns = {"value" : "difference_value"}).reset_index()
             data_strategy_summarized["difference_variable"] = 'emission_co2e_all_fgases_ippu'
-            data_strategy_summarized["variable"] = output_vars
+            # Fix: the old code referenced an undefined name `output_vars`.
+            # The intended value is the configured output variable name,
+            # matching what the baseline branch assigns a few lines below.
+            data_strategy_summarized["variable"] = cb_orm.output_variable_name
 
 
             data_strategy_base = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, fgases)
