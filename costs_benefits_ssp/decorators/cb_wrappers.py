@@ -40,6 +40,16 @@ def cb_wrapper(func):
                 if cb_orm.cb_var_group == 'wali_sanitation_cost_factors' or cb_orm.cb_var_group == 'wali_benefit_of_sanitation_cost_factors':
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
+                # Activate the detailed per-sector × per-fuel fuel cost
+                # factors. See the equivalent block in
+                # `CostBenefits.compute_cost_benefit_from_variable` for the
+                # full rationale. The aggregate `cb:enfu:fuel_cost:X:X`
+                # (`cb_var_group='enfu_fuel_cost_factors'`, without the
+                # `_detail` suffix) is NOT rescued here to avoid double
+                # counting with the detail.
+                if cb_orm.cb_var_group == 'enfu_fuel_cost_factors_detail':
+                    cb_orm.cb_function = 'cb_difference_between_two_strategies'
+
                 if cb_orm.cb_function == "cb:enfu:fuel_cost:X:X":
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
 

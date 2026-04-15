@@ -341,8 +341,34 @@ class CostBenefits:
             if v.startswith("emission_co2e_")
             and not ("_co2_" in v or "_n2o_" in v or "_ch4_" in v or "_subsector_" in v)
         ]
-        _fgtv_rx = re.compile(r"emission_co2e_.*_fgtv_fuel_.*")
+        # Match both the legacy fugitive emissions format
+        #   emission_co2e_<gas>_fgtv_fuel_<fuel>
+        # and the new stage-split format used by recent SISEPUEDE runs
+        #   emission_co2e_<gas>_fgtv_<stage>_fuel_<fuel>
+        # where <stage> ∈ {dtp, flaring, venting}. The `.*fuel_` piece is
+        # optional in practice because `.*` can match an empty string.
+        _fgtv_rx = re.compile(r"emission_co2e_.*_fgtv_.*fuel_.*")
         self._fgtv_vars = [v for v in self.ssp_list_of_vars if _fgtv_rx.match(v)]
+
+        # Derive the set of fuel keys (e.g. "fuel_coal", "fuel_natural_gas")
+        # that actually appear in the fgtv columns of this run. This is
+        # format-agnostic: for legacy columns `emission_co2e_ch4_fgtv_fuel_coal`
+        # and for new columns `emission_co2e_ch4_fgtv_flaring_fuel_coal` the
+        # extraction yields the same key `fuel_coal`.
+        self._fgtv_fuels = sorted({
+            "fuel_" + v.rsplit("fuel_", 1)[-1]
+            for v in self._fgtv_vars
+        })
+        # Only keep fuels that have a matching total energy demand column —
+        # these are the ones usable to compute fugitive intensity. In recent
+        # runs this typically includes coal, crude, natural_gas and oil; in
+        # older runs only coal, natural_gas and oil.
+        self._fgtv_energy_vars = [
+            f"energy_demand_enfu_total_{fk}"
+            for fk in self._fgtv_fuels
+            if f"energy_demand_enfu_total_{fk}" in self._ssp_col_set
+        ]
+
         self._ccs_fraction_vars = [
             v for v in self.ssp_list_of_vars
             if v.startswith("frac_ippu_production_with_co2_capture_")
@@ -598,7 +624,20 @@ class CostBenefits:
             
             if cb_orm.cb_var_group == 'wali_sanitation_cost_factors' or cb_orm.cb_var_group == 'wali_benefit_of_sanitation_cost_factors':
                 cb_orm.cb_function = 'cb_difference_between_two_strategies'
-            
+
+            # Activate the detailed per-sector × per-fuel fuel cost factors
+            # (cb:enfu:fuel_cost:<sector>:<fuel>). These rows live in
+            # `cost_factors` with `cb_function='cb_strategy_specific_function'`
+            # which is not implemented, so historically they were dead code.
+            # Their `difference_variable` values are real SSP output columns
+            # (`totalvalue_enfu_fuel_consumed_<sector>_fuel_<fuel>`), so we
+            # rescue them to `cb_difference_between_two_strategies`. The
+            # aggregate `cb:enfu:fuel_cost:X:X` (cb_var_group='enfu_fuel_cost_factors',
+            # note: no `_detail` suffix) is intentionally NOT rescued here to
+            # avoid double counting with the detail.
+            if cb_orm.cb_var_group == 'enfu_fuel_cost_factors_detail':
+                cb_orm.cb_function = 'cb_difference_between_two_strategies'
+
             if cb_orm.cb_function=="cb:enfu:fuel_cost:X:X":
                 cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
@@ -1390,7 +1429,10 @@ class CostBenefits:
         
             data_strategy_summarized = data_strategy.groupby(["region", "time_period", "strategy_code"]).agg({"value" : "sum"}).rename(columns = {"value" : "difference_value"}).reset_index()
             data_strategy_summarized["difference_variable"] = 'emission_co2e_all_fgases_ippu'
-            data_strategy_summarized["variable"] = output_vars
+            # Fix: the old code referenced an undefined name `output_vars`.
+            # The intended value is the configured output variable name,
+            # matching what the baseline branch assigns a few lines below.
+            data_strategy_summarized["variable"] = cb_orm.output_variable_name
 
 
             data_strategy_base = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, fgases)
@@ -1444,16 +1486,31 @@ class CostBenefits:
                 data = self.ssp_data
                     
             #(1) FUGITIVE EMISSIONS INTENSITY
-            energy_vars = ['energy_demand_enfu_total_fuel_coal', 'energy_demand_enfu_total_fuel_oil', 'energy_demand_enfu_total_fuel_natural_gas']
-            # Precomputed in cache (the previous code scanned ssp_list_of_vars on every call).
+            # Both `energy_vars` and `fgtv_vars` are precomputed in
+            # `_build_caches` and are format-agnostic: they work both for the
+            # legacy fugitive columns (emission_co2e_<gas>_fgtv_fuel_<fuel>)
+            # and for the new stage-split format
+            # (emission_co2e_<gas>_fgtv_<stage>_fuel_<fuel>). The fuel list is
+            # derived from the actual columns present in this run, so adding
+            # `crude` as a new fuel in recent SISEPUEDE versions is handled
+            # automatically.
+            energy_vars = self._fgtv_energy_vars
             fgtv_vars = self._fgtv_vars
 
+            if not fgtv_vars or not energy_vars:
+                # This run has no fugitive-emission columns at all, so there
+                # is nothing to compute. Returning an empty DataFrame (with
+                # the expected columns) lets the caller concat it cleanly.
+                return pd.DataFrame(columns=SSP_GLOBAL_COLNAMES_OF_RESULTS)
+
             #1. Get the fugitive emissions per PJ of coal and oil together in the baseline
-            # Vectorized string ops (antes usaban .apply con lambda).
+            # Vectorized string ops. The `rsplit("fuel_", n=1)` pattern extracts
+            # the fuel key regardless of whether the variable is legacy
+            # (`..._fgtv_fuel_coal`) or split (`..._fgtv_flaring_fuel_coal`).
             energy = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, energy_vars)
             energy["fuel"] = energy["variable"].str.replace("energy_demand_enfu_total_", "", regex=False)
             fgtv = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_base, fgtv_vars)
-            fgtv["fuel"] = fgtv["variable"].str.rsplit("_fgtv_", n=1).str[-1]
+            fgtv["fuel"] = "fuel_" + fgtv["variable"].str.rsplit("fuel_", n=1).str[-1]
 
             #1.a summarize the emissions by fuel
             vars_to_groupby = ["primary_id", "region", "time_period", "strategy_code", "fuel"]
@@ -1465,7 +1522,7 @@ class CostBenefits:
             energy_tx = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, energy_vars)
             energy_tx["fuel"] = energy_tx["variable"].str.replace("energy_demand_enfu_total_", "", regex=False)
             fgtv_tx = self.cb_get_data_from_wide_to_long(data, cb_orm.strategy_code_tx, fgtv_vars)
-            fgtv_tx["fuel"] = fgtv_tx["variable"].str.rsplit("_fgtv_", n=1).str[-1]
+            fgtv_tx["fuel"] = "fuel_" + fgtv_tx["variable"].str.rsplit("fuel_", n=1).str[-1]
 
             #2.b summarize the emissions by fuel
             fgtv_tx = fgtv_tx.groupby(vars_to_groupby).agg({"value" : "sum"}).reset_index()
@@ -1498,10 +1555,13 @@ class CostBenefits:
 
             data_merged = data_merged[SSP_GLOBAL_COLNAMES_OF_RESULTS]
 
-            #8. If tehre are NANs or NAs in the value, replace them with 0.
-            data_merged.replace(np.nan, 0.0)
-
-
+            #8. If there are NaNs/NAs in the value, replace them with 0.
+            # Fix: the previous code called `.replace(np.nan, 0.0)` without
+            # assigning the result, so the replacement was silently dropped.
+            # This is especially important for fuels like `crude` whose
+            # baseline demand may be zero, producing 0/0 = NaN in the
+            # intensity calculation.
+            data_merged = data_merged.fillna(0.0)
 
             return data_merged
         else:
