@@ -37,7 +37,11 @@ TX_DESCRIPTION = (
 )
 
 OUT_COST = "cb:fgtv:technical_cost:gas_recovery:X"
-OUT_BENEFIT = "cb:fgtv:technical_savings:gas_recovery:X"
+OUT_BENEFIT = "cb:fgtv:gas_recovery_savings:X:X"
+
+# Old benefit name — migrated to OUT_BENEFIT above. Kept here so the script
+# can rename legacy rows in-place if they exist (idempotent migration).
+OUT_BENEFIT_LEGACY = "cb:fgtv:technical_savings:gas_recovery:X"
 
 DISPLAY_COST = "Technical cost of gas flaring recovery (GFR)"
 DISPLAY_BENEFIT = "Revenue from recovered associated gas (GFR)"
@@ -92,6 +96,29 @@ def _row_exists(cur: sqlite3.Cursor, table: str, key_col: str, key_val: str) -> 
     ).fetchone() is not None
 
 
+def _migrate_legacy_benefit_name(cur: sqlite3.Cursor) -> int:
+    """Rename the legacy benefit row (old slot-3 token) to the new name in both
+    tx_table and transformation_costs. Idempotent. Returns number of tables updated."""
+    updated = 0
+    for table in ("tx_table", "transformation_costs"):
+        if _row_exists(cur, table, "output_variable_name", OUT_BENEFIT_LEGACY):
+            # If the target name already exists, just drop the legacy (should not happen in practice)
+            if _row_exists(cur, table, "output_variable_name", OUT_BENEFIT):
+                cur.execute(
+                    f"DELETE FROM {table} WHERE output_variable_name = ?",
+                    (OUT_BENEFIT_LEGACY,),
+                )
+                print(f"  ~ {table}: removed duplicate legacy row {OUT_BENEFIT_LEGACY}")
+            else:
+                cur.execute(
+                    f"UPDATE {table} SET output_variable_name = ? WHERE output_variable_name = ?",
+                    (OUT_BENEFIT, OUT_BENEFIT_LEGACY),
+                )
+                print(f"  ~ {table}: renamed {OUT_BENEFIT_LEGACY} -> {OUT_BENEFIT}")
+            updated += 1
+    return updated
+
+
 def insert_gfr_rows(db_path: Path) -> dict[str, int]:
     """Insert the 5 GFR rows. Returns a dict {table: rows_inserted}."""
     inserted = {"attribute_transformation_code": 0, "tx_table": 0, "transformation_costs": 0}
@@ -100,6 +127,9 @@ def insert_gfr_rows(db_path: Path) -> dict[str, int]:
     cur = conn.cursor()
 
     try:
+        # --- Migration: rename legacy benefit row if present ---
+        _migrate_legacy_benefit_name(cur)
+
         # --- Row 1: attribute_transformation_code ---
         if not _row_exists(cur, "attribute_transformation_code", "transformation_code", TX_CODE):
             new_id = _next_transformation_id(cur)
@@ -207,7 +237,9 @@ def verify(db_path: Path) -> None:
     print("\ntx_table (GFR):")
     for row in cur.execute(
         "SELECT output_variable_name, output_display_name, cost_type "
-        "FROM tx_table WHERE output_variable_name LIKE 'cb:fgtv:%:gas_recovery:%'"
+        "FROM tx_table "
+        "WHERE output_variable_name IN (?, ?)",
+        (OUT_COST, OUT_BENEFIT),
     ):
         print(" ", row)
 

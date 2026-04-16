@@ -30,7 +30,10 @@ TX_DESCRIPTION = (
 )
 
 OUT_COST = "cb:fgtv:technical_cost:gas_recovery:X"
-OUT_BENEFIT = "cb:fgtv:technical_savings:gas_recovery:X"
+OUT_BENEFIT = "cb:fgtv:gas_recovery_savings:X:X"
+
+# Legacy benefit name kept for in-place migration of earlier xlsx state.
+OUT_BENEFIT_LEGACY = "cb:fgtv:technical_savings:gas_recovery:X"
 
 DISPLAY_COST = "Technical cost of gas flaring recovery (GFR)"
 DISPLAY_BENEFIT = "Revenue from recovered associated gas (GFR)"
@@ -101,6 +104,26 @@ def _row_transformation_costs(out_var: str, multiplier: float, natural_units: st
     }
 
 
+def _migrate_legacy_benefit_name(all_sheets: dict) -> int:
+    """Rename the legacy benefit row to the new name in both tx_table and
+    transformation_costs sheets. Idempotent."""
+    renamed = 0
+    for sheet_name in ("tx_table", "transformation_costs"):
+        sheet = all_sheets[sheet_name]
+        mask_legacy = sheet["output_variable_name"].astype(str) == OUT_BENEFIT_LEGACY
+        has_new = (sheet["output_variable_name"].astype(str) == OUT_BENEFIT).any()
+        if mask_legacy.any():
+            if has_new:
+                all_sheets[sheet_name] = sheet[~mask_legacy].reset_index(drop=True)
+                print(f"  ~ {sheet_name}: removed duplicate legacy row {OUT_BENEFIT_LEGACY}")
+            else:
+                sheet.loc[mask_legacy, "output_variable_name"] = OUT_BENEFIT
+                all_sheets[sheet_name] = sheet
+                print(f"  ~ {sheet_name}: renamed {OUT_BENEFIT_LEGACY} -> {OUT_BENEFIT}")
+            renamed += 1
+    return renamed
+
+
 def sync_libya_xlsx(xlsx_path: Path) -> dict[str, int]:
     """Append missing GFR rows into the 3 relevant sheets. Returns counts inserted."""
     if not xlsx_path.exists():
@@ -114,6 +137,9 @@ def sync_libya_xlsx(xlsx_path: Path) -> dict[str, int]:
         "tx_table": 0,
         "transformation_costs": 0,
     }
+
+    # --- Migration: rename legacy benefit row if present ---
+    n_migrated = _migrate_legacy_benefit_name(all_sheets)
 
     # --- attribute_transformation_code ---
     sheet = all_sheets["attribute_transformation_code"]
@@ -157,8 +183,8 @@ def sync_libya_xlsx(xlsx_path: Path) -> dict[str, int]:
             print(f"  = transformation_costs: {out_var} already present")
     all_sheets["transformation_costs"] = sheet
 
-    # Write back, preserving all sheets
-    if sum(inserted.values()) > 0:
+    # Write back, preserving all sheets (also write if only a rename happened)
+    if sum(inserted.values()) > 0 or n_migrated > 0:
         with pd.ExcelWriter(xlsx_path, engine="openpyxl", mode="w") as writer:
             for sheet_name, df in all_sheets.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
