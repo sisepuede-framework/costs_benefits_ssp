@@ -6,12 +6,12 @@ from typing import Union, Dict
 
 def cb_wrapper(func):
     """
-    Decorator que resuelve cada variable output que matchea el patrón
-    `difference_variable` (p.ej. 'emission_co2e_*_ippu_foo') y acumula los
-    resultados por cada match. Incluye caching: la lista de columnas que
-    coinciden con cada patrón se calcula una sola vez en
-    `CostBenefits._build_caches` y se reutiliza desde `self._diff_var_matches`
-    (evita un loop regex sobre todas las columnas SSP en cada llamada).
+    Decorator that resolves every output variable matching the
+    `difference_variable` pattern (e.g. 'emission_co2e_*_ippu_foo') and
+    accumulates the results per match. Caches the list of columns that
+    match each pattern in `CostBenefits._build_caches` and reuses them from
+    `self._diff_var_matches` (avoids a regex loop over every SSP column on
+    each call).
     """
 
     @functools.wraps(func)
@@ -24,7 +24,7 @@ def cb_wrapper(func):
                           cb_var_fields: Union[Dict[str, Union[float, int, str]], None] = None):
 
         if cb_var_name:
-            ## Obtenemos el registro desde el cache (O(1), antes eran 2 queries SQL)
+            ## Fetch the record from the cache (O(1); previously 2 SQL queries)
             cb_orm = self.get_cb_var_fields(cb_var_name)
 
             if strategy_code_tx:
@@ -35,29 +35,39 @@ def cb_wrapper(func):
             print("---------Costs for: {cb_orm.output_variable_name}.".format(cb_orm=cb_orm))
 
             if cb_orm.tx_table.cost_type == "system_cost":
-                print("La variable se evalúa en System Cost")
+                print("The variable is evaluated in System Cost")
 
                 if cb_orm.cb_var_group == 'wali_sanitation_cost_factors' or cb_orm.cb_var_group == 'wali_benefit_of_sanitation_cost_factors':
+                    cb_orm.cb_function = 'cb_difference_between_two_strategies'
+
+                # Activate the detailed per-sector × per-fuel fuel cost
+                # factors. See the equivalent block in
+                # `CostBenefits.compute_cost_benefit_from_variable` for the
+                # full rationale. The aggregate `cb:enfu:fuel_cost:X:X`
+                # (`cb_var_group='enfu_fuel_cost_factors'`, without the
+                # `_detail` suffix) is NOT rescued here to avoid double
+                # counting with the detail.
+                if cb_orm.cb_var_group == 'enfu_fuel_cost_factors_detail':
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
                 if cb_orm.cb_function == "cb:enfu:fuel_cost:X:X":
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
             elif cb_orm.tx_table.cost_type == "transformation_cost":
-                print("La variable se evalúa en Transformation Cost")
+                print("The variable is evaluated in Transformation Cost")
 
                 if not self.tx_in_strategy(cb_orm.transformation_code, cb_orm.strategy_code_tx):
-                    print("La TX no se encuentra en la estrategia")
+                    print("The TX is not present in the strategy")
                     return pd.DataFrame()
 
-        ## Actualizamos los campos del registro si recibimos el diccionario cb_var_fields
+        ## Update the record fields if a cb_var_fields dict was received.
         if isinstance(cb_var_fields, dict):
             self.update_cost_factor_register(cb_var_name=cb_var_name,
                                              cb_var_fields=cb_var_fields)
 
-        ## Fast path: usar los matches precomputados en self._diff_var_matches.
-        ## Fallback: si por alguna razón el patrón no fue cacheado, compilamos
-        ## la regex una vez (no por cada iteración como hacía el código viejo).
+        ## Fast path: use the precomputed matches in self._diff_var_matches.
+        ## Fallback: if for some reason the pattern was not cached, compile
+        ## the regex once (instead of on every iteration like the old code).
         pattern = cb_orm.difference_variable
         diff_var_list = None
         if hasattr(self, "_diff_var_matches"):
