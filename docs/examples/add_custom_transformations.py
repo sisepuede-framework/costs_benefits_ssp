@@ -5,8 +5,11 @@ cuenta.
 
 Aplica al caso de Libia donde ATTRIBUTE_STRATEGY.csv contiene transformations
 (FRST:INCREASE_SEQUESTRATION, LNDU:BOUND_CLASSES, LNDU:DEC_CLASS_LOSS,
-ENFU:ADJ_EXPORTS, SCOE:INC_EFFICIENCY_HEAT) que no vienen por defecto en la
+ENFU:ADJ_EXPORTS, SCOE:INC_EFFICIENCY_HEAT) que no venían por defecto en la
 tabla attribute_transformation_code del paquete.
+
+(FRST:INCREASE_SEQUESTRATION ya llegó al nivel B: está registrada Y tiene
+factor de costo. Ver `scripts/add_frst_sequestration_cost.py`.)
 
 Hay DOS niveles:
 
@@ -189,43 +192,24 @@ cb.insert_cb_records("transformation_costs", transformation_costs_new)
 
 
 # Repite el mismo patrón para las demás TXs que quieras costear.
-# Ejemplo análogo para FRST:INCREASE_SEQUESTRATION (beneficio = $USD por
-# tonelada de CO2e secuestrada).
-
-tx_table_new2 = [
-    {
-        "output_variable_name": "cb:frst:benefit:carbon_sequestration",
-        "output_display_name": "Forest carbon sequestration benefit",
-        "internal_notes": "Placeholder",
-        "display_notes": "Valor del CO2 secuestrado",
-        "cost_type": "transformation_cost",
-    },
-]
-
-transformation_costs_new2 = [
-    {
-        "output_variable_name": "cb:frst:benefit:carbon_sequestration",
-        "transformation_code": "TX:FRST:INCREASE_SEQUESTRATION",
-        "include": True,
-        "include_variant": 0,
-        "test_id_variant_suffix": "",
-        "comparison_id_variant": "",
-        "cb_function": "cb_difference_between_two_strategies",
-        "difference_variable": "emission_co2e_co2_lndu_forests_*",  # ajusta
-        # USD por tonelada CO2e evitada (precio social del carbono, placeholder)
-        "multiplier": -40.0,
-        "multiplier_unit": "USD/tCO2e",
-        "annual_change": 1.0,
-        "arg1": None,
-        "arg2": None,
-        "sum": True,
-        "natural_multiplier_units": "USD/tCO2e",
-    },
-]
-
-cb.insert_cb_records("tx_table", tx_table_new2)
-cb.insert_cb_records("transformation_costs", transformation_costs_new2)
-
+#
+# FRST:INCREASE_SEQUESTRATION ya está implementada en el paquete: ver
+# `scripts/add_frst_sequestration_cost.py`, que escribe las 3 filas
+# (attribute_transformation_code + tx_table + transformation_costs) de forma
+# idempotente y puede sincronizarlas a un cb_config_params.xlsx con --xlsx.
+#
+# Los valores reales que usa son:
+#   output_variable_name = "cb:frst:technical_cost:increase_sequestration:X"
+#   difference_variable  = "emission_co2e_co2_frst_sequestration_*"  (sum = 1)
+#   multiplier           = 20_000_000    # $20/tCO2e; emisiones en MtCO2e
+#
+# OJO con el driver: esta TX sube el factor de secuestro por hectárea
+# (ef_frst_sequestration_*_kt_co2_ha) y NO mueve áreas, así que un
+# difference_variable basado en `area_lndu_*` daría diferencia ~0 y costo 0.
+# Conviene verificar siempre que el patrón matchee columnas reales del CSV de
+# salidas antes de dar por buena una TX nueva:
+#
+#   [c for c in cb.ssp_list_of_vars if c.startswith("emission_co2e_co2_frst")]
 
 # ---------------------------------------------------------------
 # 4) Corre el pipeline con la nueva configuración
