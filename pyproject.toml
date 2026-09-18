@@ -1,6 +1,6 @@
 [project]
 name = "costs_benefits_ssp"
-version = "0.1.19"
+version = "0.1.20"
 description = "Costs and Benefits package"
 readme = "README.md"
 requires-python = ">=3.11"
