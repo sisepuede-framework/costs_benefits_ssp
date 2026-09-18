@@ -995,6 +995,24 @@ class CostBenefits:
             for tb in list_of_tables:
                 #print(tb.__tablename__)
                 df = pd.read_sql(self.session.query(tb).statement, self.session.bind) 
+
+                # `transformation_id` is stored as an 8-byte little-endian
+                # BLOB in the seed DB. Written to Excel as-is it becomes the
+                # repr of the bytes object (b'\x01\x00...'), which is
+                # unreadable and does not survive a `load_cb_parameters`
+                # round-trip. Decode it to a plain integer.
+                if "transformation_id" in df.columns:
+                    df["transformation_id"] = df["transformation_id"].map(
+                        lambda v: int.from_bytes(v, "little")
+                        if isinstance(v, (bytes, bytearray)) else v
+                    )
+                    try:
+                        # nullable integer: keeps the blanks of the TXs that
+                        # carry no id instead of turning everything into floats
+                        df["transformation_id"] = df["transformation_id"].astype("Int64")
+                    except (TypeError, ValueError):
+                        pass
+
                 # use to_excel function and specify the sheet_name and index 
                 # to store the dataframe in specified sheet
                 df.to_excel(writer, sheet_name=tb.__tablename__, index=False)
