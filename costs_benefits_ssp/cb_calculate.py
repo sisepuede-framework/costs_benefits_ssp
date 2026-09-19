@@ -48,23 +48,20 @@ class CostBenefits:
 
     """
     def __init__(self, 
-                 ssp_data : pd.DataFrame,
-                 att_primary : pd.DataFrame,
-                 att_strategy : pd.DataFrame,
-                 strategy_code_base : str,
-                 logger: Union[logging.Logger, None] = None
-                 ) -> None:
+        ssp_data : pd.DataFrame,
+        att_primary : pd.DataFrame,
+        att_strategy : pd.DataFrame,
+        strategy_code_base : str,
+        logger: Union[logging.Logger, None] = None
+    ) -> None:
 
         self.session = self.initialize_session()
-        self.strategy_to_txs : Dict[str, List[str]] = self.get_strategy_to_txs(att_strategy)
-        self.att_strategy = att_strategy
-        self.strategy_code_base = strategy_code_base
-        self.ssp_data = self.marge_attribute_strategy(ssp_data, att_primary, att_strategy)
-        self.ssp_list_of_vars = list(self.ssp_data)
-        self.ssp_data = self.add_additional_columns()
-        self.ssp_list_of_vars = list(self.ssp_data)
-        # Índice por columna para acceso O(1) (usado por varias optimizaciones).
-        self._ssp_col_set = set(self.ssp_list_of_vars)
+        self._initialize_ssp_data(
+            ssp_data,
+            att_primary,
+            att_strategy,
+            strategy_code_base,
+        )
 
         # In-memory caches of every configuration table plus per-strategy
         # views of `ssp_data`. These replace the SQL reads and per-call
@@ -73,12 +70,41 @@ class CostBenefits:
         self._build_caches()
         self._build_strategy_views()
 
+        return None
+
+
+
+    def _initialize_ssp_data(self,
+        ssp_data : pd.DataFrame,
+        att_primary : pd.DataFrame,
+        att_strategy : pd.DataFrame,
+        strategy_code_base: str,
+    ) -> None:
+        """Update some properties that are dependent on ssp_data, att_primary,
+            and att_strategy. Allows for updating of data without reloading 
+            database.
+        """
+
+        self.strategy_to_txs = self.get_strategy_to_txs(att_strategy)
+        self.att_strategy = att_strategy
+        self.strategy_code_base = strategy_code_base
+        self.ssp_data = self.merge_attribute_strategy(ssp_data, att_primary, att_strategy)
+        self.ssp_list_of_vars = list(self.ssp_data)
+        self.ssp_data = self.add_additional_columns()
+        self.ssp_list_of_vars = list(self.ssp_data)
+        # Índice por columna para acceso O(1) (usado por varias optimizaciones).
+        self._ssp_col_set = set(self.ssp_list_of_vars)
+
+        return None
+
+
+
 
     ##############################################
 	#------ METODOS DE INICIALIZACION	   ------#
 	##############################################
 
-    def marge_attribute_strategy(
+    def merge_attribute_strategy(
                  self,
                  ssp_data : pd.DataFrame,
                  att_primary : pd.DataFrame,
