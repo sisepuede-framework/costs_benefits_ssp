@@ -32,10 +32,10 @@ def cb_wrapper(func):
 
             cb_orm.strategy_code_base = self.strategy_code_base
 
-            print("---------Costs for: {cb_orm.output_variable_name}.".format(cb_orm=cb_orm))
+            #print("---------Costs for: {cb_orm.output_variable_name}.".format(cb_orm=cb_orm))
 
             if cb_orm.tx_table.cost_type == "system_cost":
-                print("The variable is evaluated in System Cost")
+                #print("The variable is evaluated in System Cost")
 
                 if cb_orm.cb_var_group == 'wali_sanitation_cost_factors' or cb_orm.cb_var_group == 'wali_benefit_of_sanitation_cost_factors':
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
@@ -54,10 +54,10 @@ def cb_wrapper(func):
                     cb_orm.cb_function = 'cb_difference_between_two_strategies'
 
             elif cb_orm.tx_table.cost_type == "transformation_cost":
-                print("The variable is evaluated in Transformation Cost")
+                #print("The variable is evaluated in Transformation Cost")
 
                 if not self.tx_in_strategy(cb_orm.transformation_code, cb_orm.strategy_code_tx):
-                    print("The TX is not present in the strategy")
+                    #print("The TX is not present in the strategy")
                     return pd.DataFrame()
 
         ## Update the record fields if a cb_var_fields dict was received.

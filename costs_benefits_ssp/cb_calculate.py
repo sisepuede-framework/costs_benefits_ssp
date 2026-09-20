@@ -678,8 +678,9 @@ class CostBenefits:
             
             return df_cb_results_var
         elif cb_orm.tx_table.cost_type == "transformation_cost":
-            
-            print("The variable is evaluated in Transformation Cost")
+
+            if verbose:
+                print("The variable is evaluated in Transformation Cost")
 
             if self.tx_in_strategy(cb_orm.transformation_code, cb_orm.strategy_code_tx):
 
@@ -694,7 +695,8 @@ class CostBenefits:
 
                 return df_cb_results_var
             else:
-                print("The TX is not present in the strategy")
+                if verbose:
+                    print("The TX is not present in the strategy")
                 return pd.DataFrame()
 
     ######################################################
@@ -788,6 +790,7 @@ class CostBenefits:
                         strategy_code_base : Union[str,None] = None,
                         verbose : bool = True
                         ) -> pd.DataFrame:
+
         ## Get cb variables that will be evaluated on system cost (cache lookup)
         tx_df = self._cache["tx_table"]
         system_cost_vars = tx_df.loc[
@@ -819,12 +822,15 @@ class CostBenefits:
         total_strategies = len(all_strategies)
 
         for id_strat, strategy in enumerate(all_strategies):
-            print(f"\n************************************\n*Strategy : {strategy} ({id_strat}/{total_strategies})\n************************************\n")
+            if verbose:
+                print(f"\n************************************\n*Strategy : {strategy} ({id_strat}/{total_strategies})\n************************************\n")
             accumulate_system_costs_all_strat.append(
-                self.compute_system_cost_for_strategy(strategy,verbose = verbose)
+                self.compute_system_cost_for_strategy(strategy, verbose = verbose)
             )
         
         return pd.concat(accumulate_system_costs_all_strat, ignore_index = True)
+
+
 
     ##############################################
 	#------ TECHNICAL COSTS METHODS	   ------#
@@ -861,8 +867,11 @@ class CostBenefits:
 
             return pd.concat(accumulate_technical_costs, ignore_index = True)
         else:
-            print(f"The Strategy {strategy_code_tx} hasn't technical costs")
+            if verbose:
+                print(f"The Strategy {strategy_code_tx} hasn't technical costs")
             return pd.DataFrame()
+
+
 
     def compute_technical_cost_for_all_strategies(
                         self,
@@ -880,9 +889,11 @@ class CostBenefits:
         total_strategies = len(all_strategies)
 
         for id_strat, strategy in enumerate(all_strategies):
-            print(f"\n************************************\n*Strategy : {strategy} ({id_strat}/{total_strategies})\n************************************\n")
+            if verbose:
+                print(f"\n************************************\n*Strategy : {strategy} ({id_strat}/{total_strategies})\n************************************\n")
+
             accumulate_technical_costs_all_strat.append(
-                self.compute_technical_cost_for_strategy(strategy,verbose = verbose)
+                self.compute_technical_cost_for_strategy(strategy, verbose = verbose)
             )
         
         return pd.concat(accumulate_technical_costs_all_strat, ignore_index = True)
@@ -894,6 +905,7 @@ class CostBenefits:
     def cb_process_interactions(
                         self,
                         res : pd.DataFrame,
+                        verbose: bool = False,
         ) -> pd.DataFrame:
 
         # Interaction table from the cache (no SQL on every call).
@@ -925,11 +937,11 @@ class CostBenefits:
                 mask_strategy_tx = tx_interacting_full["transformation_code"].isin(tx_in_strategy)
                 tx_interacting = tx_interacting_full[mask_strategy_tx]
 
-                if SSP_PRINT_STRATEGIES:
+                if verbose:
                     print(f"Resolving Interactions in {interaction} : {', '.join(tx_interacting['transformation_code'].to_list())} ")
 
                 if tx_interacting.shape[0] == 0:
-                    if SSP_PRINT_STRATEGIES:
+                    if verbose:
                         print(f"No interactions, skipping... {strategy_code}")
                     continue
 
