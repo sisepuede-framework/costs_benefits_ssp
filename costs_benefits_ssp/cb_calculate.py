@@ -545,7 +545,7 @@ class CostBenefits:
                         data_baseline : Union[pd.DataFrame, None] = None,
                         data_tx :  Union[pd.DataFrame, None] = None
         ) -> Callable:
-        
+
         match cb_function:
             #case 'cb_lndu_soil_carbon':
             #    return self.cb_lndu_soil_carbon(cb_orm)
@@ -1763,9 +1763,9 @@ class CostBenefits:
                         self,
                         cb_orm : Union[CostFactor,TransformationCost],
                         data_baseline : Union[pd.DataFrame, None] = None,
-                        data_tx :  Union[pd.DataFrame, None] = None                        
+                        data_tx :  Union[pd.DataFrame, None] = None,     
                         ) -> pd.DataFrame:
-        
+
         if cb_orm.cb_function == "cb_agrc_rice_mgmt":
 
             if isinstance(data_baseline, pd.DataFrame) and isinstance(data_tx, pd.DataFrame):
@@ -1782,6 +1782,7 @@ class CostBenefits:
             # Lightweight copy of the cached frame because we are about to
             # add the `level_of_implementation` column and we do not want to
             # contaminate the cached version.
+            
             tx_definition = self._cache["agrc_rice_mgmt_tx"].copy()
             tx_definition["level_of_implementation"] = (1-tx_definition["ef_agrc_anaerobicdom_rice_kg_ch4_ha"])/0.45
             

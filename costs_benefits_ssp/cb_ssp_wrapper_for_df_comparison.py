@@ -33,6 +33,19 @@ class CBSSPWrapperForDFComparison:
 
 
 
+    def __call__(self,
+        *args,
+        **kwargs,
+    ) -> Tuple[pd.DataFrame]:
+        """Call the _calculate() method
+        """
+
+        out = self._calculate(*args, **kwargs, )
+
+        return out
+
+
+
     def _initialize_cb_objs(self,
         path_cb_config: pathlib.Path,               
     ) -> None:
@@ -186,6 +199,7 @@ class CBSSPWrapperForDFComparison:
         df_wide: pd.DataFrame,
         attr_strat: pd.DataFrame,         
         code_strat_base: Union[str, None] = None,
+        **kwargs,
     ) -> pd.DataFrame:
         """Calculate costs and benefits and return a table
         """
@@ -225,6 +239,40 @@ class CBSSPWrapperForDFComparison:
 
 
 
+    def _get_attr_variables(self,
+        df_cb: pd.DataFrame,
+        fields_only: bool = False,
+    ) -> Union[pd.DataFrame, list]:
+        """Build an attribute table for variables
+        """
+
+        fields = [
+            self.field_variable, 
+            self.field_sector, 
+            self.field_cb_type, 
+            self.field_item_1,
+            self.field_item_2
+        ]
+
+        if fields_only:
+            return fields
+
+        # build the table
+        df_attr_variable = (
+            df_cb[self.field_variable]
+            .astype(str)
+            .str
+            .split(":", n = 4, expand = True, )
+        )
+
+        # set fields and then overwrite the variable field
+        df_attr_variable.columns = fields
+        df_attr_variable[self.field_variable] = df_cb[self.field_variable].copy()
+
+        return df_attr_variable
+
+
+
     def _get_code_strat_base(self,
         code_strat_base: Union[str, None],
     ) -> str:
@@ -234,39 +282,41 @@ class CBSSPWrapperForDFComparison:
             return self.code_strategy_base_default
 
         return code_strat_base
-        
+
     
     
     def _reshape(self,
         results_shifted: pd.DataFrame,
         strategy_id_map: dict,
         primary_id_map: dict,
-    ) -> pd.DataFrame:
-        """Reshape cost-benefit results to Tableau-ready format.
+    ) -> Tuple[pd.DataFrame]:
+        """Reshape cost-benefit results to a Tableau-like format. Returns a 
+            tuple of the form
+
+            (
+                df_cb,              # output DataFrame with cost benefit 
+                                    #   variables; long and formatted for 
+                                    #   tableau-like use
+                df_attr_variable,   # attribute table for variables; used to 
+                                    #   facilitate combining and regrouping 
+                                    #   variables
+            )
     
         Steps
         -----
-        1.  Split variable string into (name, sector, cb_type, item_1, item_2).
+        1.  Split variable string into (name, sector, cb_tyvpe, item_1, item_2).
         2.  Scale USD → billions USD.
         3.  Drop pre-2025 shifted rows.
-        4.  Add Year, strategy label, strategy_id, primary_id, ids, gdp_mmm_usd.
         """
-        cb = results_shifted.copy()
+        df_cb = results_shifted.copy()
     
-        # 1. Decompose variable
-        parts = cb[self.field_variable].astype(str).str.split(":", n=4, expand=True)
-        parts.columns = [
-            self.field_variable, 
-            self.field_sector, 
-            self.field_cb_type, 
-            self.field_item_1,
-            self.field_item_2
-        ]
-        
-        cb = pd.concat(
+        # 1. split variable information out and create attribute table
+        df_attr_variable = self._get_attr_variables(df_cb, )
+
+        df_cb = pd.concat(
             [
-                cb, 
-                parts
+                df_cb, 
+                df_attr_variable
                 .drop(
                     columns = [
                         self.field_variable,
@@ -277,30 +327,20 @@ class CBSSPWrapperForDFComparison:
         )
     
         # 2. USD → billions
-        cb[self.field_value] = cb[self.field_value] / 1e9
+        df_cb[self.field_value] = df_cb[self.field_value] / 1e9
     
         # 3. Remove shifted entries (costs that were redistrubuted pre-2025)
-        self.cb = cb
-        cb = cb[~cb[self.field_item_2].astype(str).str.contains("shifted", na=False)]
-        cb = cb[~cb[self.field_variable].astype(str).str.contains("shifted2", na=False)]
-    
-        # 4. year
-        cb = pd.merge(
-            cb,
-            self.model_attributes.get_dimensional_attribute_table(
-                self.model_attributes.dim_time_period
-            ).table,
-            how = "left",
-        )
+        df_cb = df_cb[~df_cb[self.field_item_2].astype(str).str.contains("shifted", na=False)]
+        df_cb = df_cb[~df_cb[self.field_variable].astype(str).str.contains("shifted2", na=False)]
     
         # 5. Strategy metadata from the maps (dynamic — no hardcoding)
-        cb[self.key_strategy] = cb[self.field_strategy_code].map(strategy_id_map)
-        cb[self.key_primary]  = cb[self.field_strategy_code].map(primary_id_map)
+        df_cb[self.key_strategy] = df_cb[self.field_strategy_code].map(strategy_id_map)
+        df_cb[self.key_primary]  = df_cb[self.field_strategy_code].map(primary_id_map)
 
         # 6. Unique identifier
-        cb[self.field_variable] = [
+        df_cb[self.field_variable] = [
             x.replace(":", "_") for x in 
-            cb[self.field_variable].astype(str).values
+            df_cb[self.field_variable].astype(str).values
         ]
     
         # 7. TEMP PATCH: drop ENTC technical-cost rows with the wrong sign
@@ -309,28 +349,26 @@ class CBSSPWrapperForDFComparison:
         #    dashboard, which is not meaningful. Remove until the upstream ENTC
         #    technical-cost calculation is fixed.
         bad_sign = (
-            (cb[self.field_sector] == "entc")
-            & (cb[self.field_cb_type] == self.field_technical_cost)
-            & (cb[self.field_value] > 0)
+            (df_cb[self.field_sector] == "entc")
+            & (df_cb[self.field_cb_type] == self.field_technical_cost)
+            & (df_cb[self.field_value] > 0)
         )
         if bad_sign.any():
-            """
-            dropped = cb.loc[bad_sign, [self.field_variable, self.field_strategy_code, "Year"]]
-            print(
-                f"[cb_pipeline] TEMP PATCH: dropping {bad_sign.sum()} wrong-sign "
-                "ENTC technical-cost rows:"
-            )
-            for var, grp in dropped.groupby(self.field_variable):
-                years = ", ".join(
-                    f"{s} {y}"
-                    for s, y in grp[[self.field_strategy_code, "Year"]].itertuples(index=False, name=None)
-                )
-                print(f"    {var}: {years}")
-            """
-            cb = cb[~bad_sign].copy()
+            df_cb = df_cb[~bad_sign].copy()
 
 
         ##  CLEAN UP
+        
+        # reduce the attribute table
+        df_attr_variable = self._get_attr_variables(None, fields_only = True, )
+        df_attr_variable = (
+            df_cb
+            .get(df_attr_variable, )
+            .copy()
+            .drop_duplicates()
+            .sort_values(by = [self.field_variable])
+            .reset_index(drop = True, )
+        )
 
         fields_ind = [
             self.key_strategy,
@@ -338,17 +376,17 @@ class CBSSPWrapperForDFComparison:
             self.field_variable,
         ]
     
-        cb = (
-            cb
+        df_cb = (
+            df_cb
             .get(fields_ind + [self.field_value])
             .groupby(fields_ind)
             .sum()
             .reset_index()
         )
 
-        cb = (
+        df_cb = (
             sf.pivot_df_clean(
-                cb,
+                df_cb,
                 [self.field_variable],
                 [self.field_value]
             )
@@ -360,8 +398,14 @@ class CBSSPWrapperForDFComparison:
             )
             .reset_index(drop = True, )
         )
+
+        # set output
+        out = (
+            df_cb,
+            df_attr_variable,
+        )
         
-        return cb
+        return out
 
 
         
@@ -427,3 +471,94 @@ class CBSSPWrapperForDFComparison:
         )
 
         return df_out
+
+
+
+    ###########################
+    #    SOME PLOT SUPPORT    #
+    ###########################
+
+    def get_agg_columns_from_df_attr_var(self,
+        df_attr_var: pd.DataFrame,
+        key_grouping: Union[str, None] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Using the attrbute table for variables, map groupings to fields
+        """
+
+        key_grouping = self.get_key_grouping(key_grouping, )
+
+        # get the dictionary mapping groups to fields
+        dict_key_to_var = sf.group_df_as_dict(
+            df_attr_var[[key_grouping, self.field_variable]],
+            [key_grouping]
+        )
+        dict_key_to_var = dict(
+            (k, v[self.field_variable].to_numpy())
+            for k, v in dict_key_to_var.items()
+        )
+
+        return dict_key_to_var
+
+
+        
+    def get_cba_plot_data(self,
+        df_cb: pd.DataFrame,
+        df_attr_var: pd.DataFrame,
+        key_grouping: Union[str, None] = None,
+    ) -> pd.DataFrame:
+        """Generate a DataFrame for plotting
+        """
+
+        # get the dictionary mapping groups to fields
+        dict_key_to_var = self.get_agg_columns_from_df_attr_var(
+            df_attr_var, 
+            key_grouping = key_grouping,
+        )
+
+        # build another 
+        fields_ind = [
+            self.key_strategy,
+            self.model_attributes.dim_time_period,
+        ]
+
+        # store fields that are 
+        fields_posneg = []
+        fields_uni = []
+        
+        df_new = df_cb[fields_ind].copy()
+        for k, v in dict_key_to_var.items():
+            vec = df_cb[v].sum(axis = 1, )
+
+            # specify field classes for ordering
+            (
+                fields_posneg.append(k)
+                if (vec.min() < 0) & (vec.max() > 0)
+                else fields_uni.append(k)
+            )
+            
+            df_new[k] = vec
+
+        # set ordering
+        fields_ord = fields_ind + fields_posneg + fields_uni
+        df_new = df_new.get(fields_ord)
+        
+        return df_new
+
+
+
+    def get_key_grouping(self,
+        key_grouping: Union[str, None] = None,
+    ) -> str:
+        """Get a key grouping based on the input
+        """
+        key_grouping = (
+            self.field_cb_type
+            if not isinstance(key_grouping, str)
+            else key_grouping
+        )
+
+        return key_grouping
+
+
+
+
